@@ -452,6 +452,16 @@ async def main():
     if r.status_code != 403:
         failures.append(f"T12 missing user_id must be 403 when enforced, got {r.status_code}")
 
+    # T13: 2-glasses-for-1-user case — both ids accepted, third rejected
+    shim_main.ROKID_ALLOWED_USER_IDS = {"glasses-a", "glasses-b"}
+    r_a = await post_raw("glasses-a")
+    r_b = await post_raw("glasses-b")
+    r_c = await post_raw("intruder")
+    print(f"[T13 two-glasses one-user] a={r_a.status_code} b={r_b.status_code} intruder={r_c.status_code}")
+    if r_a.status_code != 200: failures.append("T13 glasses-a should pass")
+    if r_b.status_code != 200: failures.append("T13 glasses-b should pass")
+    if r_c.status_code != 403: failures.append("T13 intruder should be 403")
+
     # Reset to off so any later mock-test reuse stays open
     shim_main.ROKID_ALLOWED_USER_IDS = set()
 
