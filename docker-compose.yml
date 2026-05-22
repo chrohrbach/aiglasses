@@ -12,6 +12,10 @@ services:
       - ROKID_AK=${ROKID_AK}
       - ROKID_CALLBACK_URL=${ROKID_CALLBACK_URL:-}
       - ROKID_SK_TOKEN=${ROKID_SK_TOKEN:-}
+      # CRITICAL: comma-separated Rokid user_id allowlist. Empty = open (safe
+      # only while the agent stays in 草稿/private). MUST be set before
+      # publishing the agent to the Rokid store.
+      - ROKID_ALLOWED_USER_IDS=${ROKID_ALLOWED_USER_IDS:-}
       # --- LiteLLM backend (all 3 paths go here) ---
       - LITELLM_URL=${LITELLM_URL:-http://litellm:4000/v1}
       - LITELLM_API_KEY=${LITELLM_API_KEY:-sk-anything}

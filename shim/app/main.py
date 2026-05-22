@@ -28,6 +28,27 @@ logger = logging.getLogger("rokid-shim")
 ROKID_AK = os.environ["ROKID_AK"]
 PUSH_SHARED_SECRET = os.environ.get("PUSH_SHARED_SECRET", "")
 
+# Per-user authorization. Comma-separated Rokid user_ids that may invoke this
+# agent. CRITICAL when the agent is published to the Rokid store (智能体商店),
+# otherwise ANY Rokid user who installs it would invoke our shim with the
+# shared AK and reach our MCP tools (Gmail, Office, casasmooth…).
+# Empty / unset (default) = allowlist DISABLED — every authenticated caller
+# is allowed. Safe ONLY while the agent stays in 草稿/private. Find your own
+# user_id by checking `docker logs rokid-shim` after a real glasses call.
+ROKID_ALLOWED_USER_IDS = {
+    u.strip() for u in os.environ.get("ROKID_ALLOWED_USER_IDS", "").split(",") if u.strip()
+}
+if ROKID_ALLOWED_USER_IDS:
+    logger.warning(
+        "user_id allowlist ENFORCED (%d entries) — rejecting any other Rokid user",
+        len(ROKID_ALLOWED_USER_IDS),
+    )
+else:
+    logger.warning(
+        "ROKID_ALLOWED_USER_IDS is empty — allowlist DISABLED. Safe only while "
+        "the agent stays in 草稿/private. Set this env var BEFORE 提审/发布."
+    )
+
 app = FastAPI(title="Rokid → Plexus shim")
 catalog = McpToolCatalog()
 
@@ -55,6 +76,18 @@ def _check_rokid_auth(authorization: str | None) -> None:
         raise HTTPException(status_code=401, detail="invalid auth")
 
 
+def _check_user_id(user_id: str | None) -> None:
+    """Enforce ROKID_ALLOWED_USER_IDS allowlist if configured."""
+    if not ROKID_ALLOWED_USER_IDS:
+        return  # disabled — allow all
+    if not user_id:
+        logger.warning("REJECT: request has no user_id but allowlist is enforced")
+        raise HTTPException(status_code=403, detail="user_id required")
+    if user_id not in ROKID_ALLOWED_USER_IDS:
+        logger.warning("REJECT: user_id=%r not in allowlist", user_id)
+        raise HTTPException(status_code=403, detail="user not authorized")
+
+
 @app.post("/rokid/agent")
 async def rokid_agent(
     request: Request,
@@ -68,6 +101,14 @@ async def rokid_agent(
     except Exception as e:
         logger.warning("bad request: %s", e)
         return JSONResponse({"error": str(e)}, status_code=400)
+
+    # Log the user_id before any auth decision so the operator can grab it from
+    # the logs to populate ROKID_ALLOWED_USER_IDS later.
+    logger.info(
+        "INCOMING agent_id=%s message_id=%s user_id=%r items=%d",
+        req.agent_id, req.message_id, req.user_id, len(req.message),
+    )
+    _check_user_id(req.user_id)
 
     # Replace incoming Rokid CDN URLs with cached local URLs / inlined base64
     # before the model sees them.

@@ -407,6 +407,54 @@ async def main():
     if health.get("mcp_tool_count") != 2:
         failures.append(f"T8 expected 2 tools from mock hub, got {health.get('mcp_tool_count')}")
 
+    # --- T9-T12: ROKID_ALLOWED_USER_IDS allowlist ---
+    # The env was empty at import time so the allowlist is currently OFF
+    # (every authenticated caller allowed). Mutate the module attribute to
+    # exercise the enforcing branch.
+    from app import main as shim_main
+
+    async def post_raw(user_id):
+        body = {"message_id": "alw", "agent_id": "t",
+                "message": [{"role": "user", "type": "text", "text": "Bonjour"}]}
+        if user_id is not None:
+            body["user_id"] = user_id
+        async with httpx.AsyncClient(timeout=10.0) as c:
+            return await c.post(
+                f"http://127.0.0.1:{SHIM_PORT}/rokid/agent",
+                json=body,
+                headers={"Authorization": "Bearer test-ak-secret",
+                         "Content-Type": "application/json"},
+            )
+
+    # T9: empty allowlist (current state) — any user_id passes
+    shim_main.ROKID_ALLOWED_USER_IDS = set()
+    r = await post_raw("rando-user-42")
+    print(f"[T9 empty-allowlist any user] status={r.status_code}")
+    if r.status_code != 200:
+        failures.append(f"T9 empty allowlist should accept everyone, got {r.status_code}")
+
+    # T10: allowlist = {"alice"}, caller with user_id=alice -> 200
+    shim_main.ROKID_ALLOWED_USER_IDS = {"alice-id"}
+    r = await post_raw("alice-id")
+    print(f"[T10 listed user] status={r.status_code}")
+    if r.status_code != 200:
+        failures.append(f"T10 listed user should pass, got {r.status_code}")
+
+    # T11: allowlist = {"alice"}, caller with user_id=bob -> 403
+    r = await post_raw("bob-id")
+    print(f"[T11 unlisted user] status={r.status_code} body={r.text[:120]!r}")
+    if r.status_code != 403:
+        failures.append(f"T11 unlisted user must be 403, got {r.status_code}")
+
+    # T12: allowlist enforced, no user_id in request -> 403 (refuse anon)
+    r = await post_raw(None)
+    print(f"[T12 no user_id when enforced] status={r.status_code}")
+    if r.status_code != 403:
+        failures.append(f"T12 missing user_id must be 403 when enforced, got {r.status_code}")
+
+    # Reset to off so any later mock-test reuse stays open
+    shim_main.ROKID_ALLOWED_USER_IDS = set()
+
     print()
     if failures:
         print("FAILURES:")
