@@ -45,7 +45,7 @@ mock_owui = FastAPI()
 owui_seen: dict = {}
 
 
-@mock_owui.post("/api/chat/completions")
+@mock_owui.post("/openai/chat/completions")
 async def owui_completions(request: Request):
     body = await request.json()
     owui_seen.clear()
@@ -224,19 +224,32 @@ async def main():
     print(f"[T2 vision] model_called={litellm_seen.get('model')!r} text={text!r}")
     if litellm_seen.get("model") != "vision-model":
         failures.append(f"T2 expected vision-model, got {litellm_seen.get('model')}")
-    # Image URL should have been rewritten to the local cache
+    # Image URL should now be a data: URL with the fake bytes inlined
     user_msg = [m for m in litellm_seen["messages"] if m["role"] == "user"][0]
     img_part = next((p for p in user_msg["content"] if p.get("type") == "image_url"), None)
-    if not img_part or not img_part["image_url"]["url"].startswith(f"http://127.0.0.1:{SHIM_PORT}/photos/"):
-        failures.append(f"T2 image url not rewritten: {img_part}")
+    img_url_sent = img_part["image_url"]["url"] if img_part else ""
+    if not img_url_sent.startswith("data:image/"):
+        failures.append(f"T2 image url not inlined as data: {img_url_sent[:80]}")
     else:
-        # Verify the local URL actually serves the cached bytes
-        cached_url = img_part["image_url"]["url"]
+        import base64 as _b64
+        b64_part = img_url_sent.split(",", 1)[1]
+        decoded = _b64.b64decode(b64_part)
+        print(f"[T2 inline] data URL len={len(img_url_sent)} decoded={len(decoded)} bytes")
+        if b"FAKE_JPEG_BYTES" not in decoded:
+            failures.append(f"T2 inlined bytes wrong: {decoded[:40]!r}")
+    # AND the disk cache should still hold a copy for downstream tools
+    photos_on_disk = list(os.scandir(os.environ["PHOTO_CACHE_DIR"]))
+    print(f"[T2 disk] photos cached: {[p.name for p in photos_on_disk]}")
+    if not photos_on_disk:
+        failures.append("T2 disk cache empty after vision turn")
+    else:
+        # Verify the local /photos/{name} route still serves them
+        first = photos_on_disk[0].name
         async with httpx.AsyncClient() as c:
-            r = await c.get(cached_url)
-        print(f"[T2 cache] GET {cached_url} -> {r.status_code} ({len(r.content)} bytes)")
+            r = await c.get(f"http://127.0.0.1:{SHIM_PORT}/photos/{first}")
+        print(f"[T2 served] GET /photos/{first} -> {r.status_code} ({len(r.content)} bytes)")
         if r.status_code != 200 or b"FAKE_JPEG_BYTES" not in r.content:
-            failures.append(f"T2 cached photo not retrievable: status={r.status_code}")
+            failures.append(f"T2 disk-served photo wrong: status={r.status_code}")
 
     # --- T3: tool-keyword text -> full path (OpenWebUI) ---
     owui_seen.clear()

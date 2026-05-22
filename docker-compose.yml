@@ -29,6 +29,7 @@ services:
       - PHOTOS_PUBLIC_URL=${PHOTOS_PUBLIC_URL:-http://rokid-shim:8000}
       - PHOTO_RETENTION_HOURS=${PHOTO_RETENTION_HOURS:-48}
       - PHOTO_MAX_BYTES=${PHOTO_MAX_BYTES:-10485760}
+      - PHOTO_INLINE_BASE64=${PHOTO_INLINE_BASE64:-true}
       # --- Push endpoint ---
       - PUSH_SHARED_SECRET=${PUSH_SHARED_SECRET:-}
       # --- Misc ---

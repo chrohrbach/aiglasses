@@ -33,7 +33,10 @@ async def stream_chat(messages: list[dict]) -> AsyncIterator[str]:
     async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, read=None)) as client:
         async with client.stream(
             "POST",
-            f"{OPENWEBUI_URL}/api/chat/completions",
+            # /openai/chat/completions is the raw passthrough — OpenAI-compat,
+            # no UI-only fields required. /api/chat/completions needs chat_id +
+            # per-message id and is meant for the web client.
+            f"{OPENWEBUI_URL}/openai/chat/completions",
             json=payload,
             headers=headers,
         ) as resp:
