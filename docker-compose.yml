@@ -12,18 +12,22 @@ services:
       - ROKID_AK=${ROKID_AK}
       - ROKID_CALLBACK_URL=${ROKID_CALLBACK_URL:-}
       - ROKID_SK_TOKEN=${ROKID_SK_TOKEN:-}
-      # --- OpenWebUI backend (full path) ---
-      - OPENWEBUI_URL=${OPENWEBUI_URL:-http://openwebui:8080}
-      - OPENWEBUI_API_KEY=${OPENWEBUI_API_KEY}
-      - OPENWEBUI_MODEL=${OPENWEBUI_MODEL:-purpose-tool-calling}
-      - OPENWEBUI_TEMPERATURE=${OPENWEBUI_TEMPERATURE:-0.4}
-      # --- LiteLLM backend (fast + vision paths) ---
+      # --- LiteLLM backend (all 3 paths go here) ---
       - LITELLM_URL=${LITELLM_URL:-http://litellm:4000/v1}
       - LITELLM_API_KEY=${LITELLM_API_KEY:-sk-anything}
       - LITELLM_TEMPERATURE=${LITELLM_TEMPERATURE:-0.4}
       - ROKID_FAST_MODEL=${ROKID_FAST_MODEL:-infomaniak-ministral}
       - ROKID_VISION_MODEL=${ROKID_VISION_MODEL:-purpose-vision}
+      - ROKID_FULL_MODEL=${ROKID_FULL_MODEL:-purpose-tool-calling}
       - ROKID_FAST_MAX_CHARS=${ROKID_FAST_MAX_CHARS:-120}
+      # --- mcp-hub for the full path's tool fanout ---
+      - MCP_HUB_URL=${MCP_HUB_URL:-http://mcp-hub:8012}
+      - MCP_HUB_AUTH_TOKEN=${MCP_HUB_AUTH_TOKEN:-}
+      # Comma-separated profile list. Default = mail+personal+knowledge covers
+      # mail/calendar/sms/notes/memory/casasmooth — voice-relevant set.
+      - ROKID_MCP_PROFILES=${ROKID_MCP_PROFILES:-mail,personal,knowledge}
+      - MCP_TOOLS_CACHE_TTL=${MCP_TOOLS_CACHE_TTL:-300}
+      - MCP_TOOL_TIMEOUT=${MCP_TOOL_TIMEOUT:-30}
       # --- Photo cache ---
       - PHOTO_CACHE_DIR=/app/data/photos
       - PHOTOS_PUBLIC_URL=${PHOTOS_PUBLIC_URL:-http://rokid-shim:8000}

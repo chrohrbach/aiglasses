@@ -1,10 +1,10 @@
 """FastAPI shim that bridges Rokid Lingzhu custom-agent SSE to Plexus.
 
 Endpoints:
-    POST /rokid/agent       — Rokid calls this. Routed (fast / vision / full).
+    POST /rokid/agent       — Rokid calls this. Routed (fast / vision / full+tools).
     POST /push              — Internal. Push an async message back to Rokid.
     GET  /photos/{name}     — Serves cached camera frames.
-    GET  /health            — Liveness.
+    GET  /health            — Liveness + tool count.
 
 Rokid contract:  https://rokid.yuque.com/ub8h5n/hth52o/qq4gs616xz4ellh1
 """
@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from . import photo_cache, rokid_callback, router
+from .mcp_tools import McpToolCatalog
 from .rokid_types import RokidEventPayload, RokidRequest, RokidToolCall
 from .tool_extractor import split_stream
 from .translator import rokid_to_openai_messages
@@ -28,11 +29,24 @@ ROKID_AK = os.environ["ROKID_AK"]
 PUSH_SHARED_SECRET = os.environ.get("PUSH_SHARED_SECRET", "")
 
 app = FastAPI(title="Rokid → Plexus shim")
+catalog = McpToolCatalog()
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    try:
+        tools = await catalog.get_tools()
+        tool_count = len(tools)
+        tool_err = None
+    except Exception as e:
+        tool_count = 0
+        tool_err = f"{type(e).__name__}: {e}"
+    return {
+        "status": "ok",
+        "mcp_profile": catalog.profile,
+        "mcp_tool_count": tool_count,
+        "mcp_tool_error": tool_err,
+    }
 
 
 def _check_rokid_auth(authorization: str | None) -> None:
@@ -55,8 +69,8 @@ async def rokid_agent(
         logger.warning("bad request: %s", e)
         return JSONResponse({"error": str(e)}, status_code=400)
 
-    # Replace incoming Rokid CDN URLs with cached local URLs before the model
-    # sees them — guarantees later turns / tool calls can still reach the photo.
+    # Replace incoming Rokid CDN URLs with cached local URLs / inlined base64
+    # before the model sees them.
     await photo_cache.cache_request_images(req)
 
     path = router.pick_path(req)
@@ -73,7 +87,9 @@ async def rokid_agent(
     async def event_stream():
         pending_tool: dict | None = None
         try:
-            async for part in split_stream(router.stream_for_path(path, messages)):
+            async for part in split_stream(
+                router.stream_for_path(path, messages, catalog=catalog)
+            ):
                 if part.kind == "text" and part.text:
                     yield RokidEventPayload(
                         message_id=req.message_id,
@@ -117,8 +133,6 @@ async def rokid_agent(
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
-# --- /photos/{name} ---------------------------------------------------------
-
 @app.get("/photos/{name}")
 async def get_photo(name: str):
     path = photo_cache.get_path(name)
@@ -126,8 +140,6 @@ async def get_photo(name: str):
         raise HTTPException(status_code=404, detail="not found")
     return FileResponse(path)
 
-
-# --- /push ------------------------------------------------------------------
 
 class PushRequest(BaseModel):
     account_id: str
@@ -141,11 +153,7 @@ async def push(
     body: PushRequest,
     x_push_secret: str | None = Header(default=None, alias="X-Push-Secret"),
 ):
-    """Forward an outbound message to a glasses user via Rokid callback.
-
-    Auth: if PUSH_SHARED_SECRET is set in env, callers must send the matching
-    X-Push-Secret header. Empty env disables the check (intra-cluster only).
-    """
+    """Forward an outbound message to a glasses user via Rokid callback."""
     if PUSH_SHARED_SECRET and x_push_secret != PUSH_SHARED_SECRET:
         raise HTTPException(status_code=401, detail="invalid push secret")
     try:

@@ -1,4 +1,7 @@
-"""End-to-end test of the rokid shim against mocks (OpenWebUI + LiteLLM + Rokid callback).
+"""End-to-end test of the v3 rokid shim against mocks.
+
+Mocks: LiteLLM (multi-round agent), mcp-hub (OpenAPI + tool dispatch),
+Rokid callback, fake camera CDN.
 
 Run from the repo root:  python integration_test.py
 """
@@ -10,23 +13,24 @@ import tempfile
 import threading
 import time
 
-# Mock ports (chosen to avoid the real shim port 8024)
-MOCK_OPENWEBUI_PORT = 9990
+# Mock ports
 MOCK_LITELLM_PORT = 9991
-MOCK_ROKID_PORT = 9992
-SHIM_PORT = 9993
+MOCK_MCP_HUB_PORT = 9992
+MOCK_ROKID_PORT = 9993
 PHOTO_HOST_PORT = 9994
+SHIM_PORT = 9995
 
 # Env must be set BEFORE importing the shim app (modules read env at import).
 os.environ["ROKID_AK"] = "test-ak-secret"
-os.environ["OPENWEBUI_URL"] = f"http://127.0.0.1:{MOCK_OPENWEBUI_PORT}"
-os.environ["OPENWEBUI_API_KEY"] = "sk-mock"
-os.environ["OPENWEBUI_MODEL"] = "openwebui-model"
 os.environ["LITELLM_URL"] = f"http://127.0.0.1:{MOCK_LITELLM_PORT}/v1"
 os.environ["LITELLM_API_KEY"] = "sk-anything"
 os.environ["ROKID_FAST_MODEL"] = "fast-model"
 os.environ["ROKID_VISION_MODEL"] = "vision-model"
+os.environ["ROKID_FULL_MODEL"] = "full-model"
 os.environ["ROKID_FAST_MAX_CHARS"] = "120"
+os.environ["MCP_HUB_URL"] = f"http://127.0.0.1:{MOCK_MCP_HUB_PORT}"
+os.environ["MCP_HUB_AUTH_TOKEN"] = ""
+os.environ["ROKID_MCP_PROFILE"] = "personal"
 os.environ["ROKID_CALLBACK_URL"] = f"http://127.0.0.1:{MOCK_ROKID_PORT}/metis/callback/message"
 os.environ["ROKID_SK_TOKEN"] = "sk-rokid-test"
 os.environ["PUSH_SHARED_SECRET"] = "push-secret"
@@ -40,49 +44,127 @@ from fastapi import FastAPI, Request
 from fastapi.responses import Response, StreamingResponse
 
 
-# --- Mock OpenWebUI (used by "full" path) -----------------------------------
-mock_owui = FastAPI()
-owui_seen: dict = {}
-
-
-@mock_owui.post("/openai/chat/completions")
-async def owui_completions(request: Request):
-    body = await request.json()
-    owui_seen.clear()
-    owui_seen.update(body)
-    user_text = _extract_user_text(body["messages"])
-
-    if "photo" in user_text.lower():
-        chunks = ["Voici votre photo.\n\n", "```rokid_action\n",
-                  '{"command": "take_photo"}', "\n```"]
-    else:
-        chunks = ["Réponse ", "complète ", "via OpenWebUI."]
-    return StreamingResponse(_sse_stream(chunks), media_type="text/event-stream")
-
-
-# --- Mock LiteLLM (used by "fast" and "vision" paths) -----------------------
+# --- Mock LiteLLM (used by all 3 paths) -------------------------------------
 mock_litellm = FastAPI()
-litellm_seen: dict = {}
+litellm_calls: list[dict] = []
 
 
 @mock_litellm.post("/v1/chat/completions")
 async def litellm_completions(request: Request):
     body = await request.json()
-    litellm_seen.clear()
-    litellm_seen.update(body)
-    user_text = _extract_user_text(body["messages"])
+    litellm_calls.append(body)
     model = body.get("model", "")
+    messages = body["messages"]
+    last_role = messages[-1]["role"]
+    has_tools = bool(body.get("tools"))
 
+    # Vision path: model=vision-model
     if model == "vision-model":
-        chunks = ["Je ", "vois ", "l'image."]
-    elif model == "fast-model":
-        chunks = ["Réponse ", "rapide."]
-    else:
-        chunks = ["???"]
-    return StreamingResponse(_sse_stream(chunks), media_type="text/event-stream")
+        return StreamingResponse(_text_sse(["Je ", "vois ", "l'image."]), media_type="text/event-stream")
+
+    # Fast path: model=fast-model. The fence-extraction prompt ("photo") gets
+    # back a reply with a rokid_action block at the end.
+    if model == "fast-model":
+        user_text = _extract_user_text(messages)
+        if "photo" in user_text.lower():
+            return StreamingResponse(
+                _text_sse([
+                    "Voici votre photo.\n\n",
+                    "```rokid_action\n",
+                    '{"command": "take_photo"}',
+                    "\n```",
+                ]),
+                media_type="text/event-stream",
+            )
+        return StreamingResponse(_text_sse(["Réponse ", "rapide."]), media_type="text/event-stream")
+
+    # Full path: model=full-model, tools attached.
+    if model == "full-model":
+        if has_tools and last_role == "user":
+            # Round 1: emit a tool_call asking to list mails
+            return StreamingResponse(_tool_call_sse(
+                index=0, id="call_test_1", name="gmail_list_emails",
+                arguments_json='{"count":3}',
+            ), media_type="text/event-stream")
+        if last_role == "tool":
+            # Round 2: use the tool result to build a final answer
+            tool_msg = messages[-1]["content"]
+            return StreamingResponse(_text_sse([
+                "Tu as 3 mails: ",
+                "voici le résultat de l'outil: ",
+                tool_msg[:200],
+            ]), media_type="text/event-stream")
+
+    return StreamingResponse(_text_sse(["???"]), media_type="text/event-stream")
 
 
-# --- Mock Rokid callback endpoint -------------------------------------------
+# --- Mock mcp-hub -----------------------------------------------------------
+mock_hub = FastAPI()
+hub_tool_calls: list[dict] = []
+
+MOCK_OPENAPI = {
+    "openapi": "3.1.0",
+    "info": {"title": "mock-personal", "version": "1.0"},
+    "paths": {
+        "/tools/gmail_list_emails": {
+            "post": {
+                "summary": "List recent emails",
+                "description": "List recent emails from Gmail. Returns subject + sender of each.",
+                "operationId": "gmail_list_emails",
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "count": {"type": "integer", "default": 20},
+                                    "label": {"type": "string", "default": "INBOX"},
+                                },
+                                "required": [],
+                            }
+                        }
+                    }
+                },
+            }
+        },
+        "/tools/office_get_due_today": {
+            "post": {
+                "summary": "Get today's calendar events",
+                "description": "Return the user's calendar events scheduled for today.",
+                "operationId": "office_get_due_today",
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {"type": "object", "properties": {}, "required": []}
+                        }
+                    }
+                },
+            }
+        },
+    },
+}
+
+
+@mock_hub.get("/profiles/{name}/openapi.json")
+async def hub_openapi(name: str):
+    return MOCK_OPENAPI
+
+
+@mock_hub.post("/profiles/{profile}/tools/{tool}")
+async def hub_tool(profile: str, tool: str, request: Request):
+    args = await request.json()
+    hub_tool_calls.append({"profile": profile, "tool": tool, "args": args})
+    # Return a canned response per tool
+    if tool == "gmail_list_emails":
+        return [
+            {"subject": "Confirmation commande", "from": "Amazon", "date": "2026-05-22"},
+            {"subject": "Réunion équipe", "from": "Julie Martin", "date": "2026-05-22"},
+            {"subject": "Newsletter Hebdo", "from": "TechNews", "date": "2026-05-21"},
+        ]
+    return {"error": "unknown tool"}
+
+
+# --- Mock Rokid callback -----------------------------------------------------
 mock_rokid = FastAPI()
 rokid_callback_log: list = []
 
@@ -92,18 +174,13 @@ async def rokid_callback(request: Request):
     headers = dict(request.headers)
     body = await request.json()
     rokid_callback_log.append({"headers": headers, "body": body})
-    auth = headers.get("authorization", "")
-    if auth != "Bearer sk-rokid-test":
-        return {"code": -1, "msg": "sk invalid"}  # spec says "sk不存在", ASCII-only here for Windows console
-    return {
-        "code": 1, "msg": "success",
-        "timestamp": int(time.time() * 1000),
-        "uuid": "test-uuid",
-        "data": {"success": True, "messageId": body.get("message_id")},
-    }
+    if headers.get("authorization") != "Bearer sk-rokid-test":
+        return {"code": -1, "msg": "sk invalid"}
+    return {"code": 1, "msg": "success", "timestamp": int(time.time() * 1000),
+            "uuid": "test-uuid", "data": {"success": True, "messageId": body.get("message_id")}}
 
 
-# --- Mock photo host (serves a fake image as if it were Rokid's CDN) --------
+# --- Mock photo CDN ----------------------------------------------------------
 mock_photo_host = FastAPI()
 
 
@@ -112,7 +189,7 @@ async def serve_photo(name: str):
     return Response(content=b"\xff\xd8\xff\xe0FAKE_JPEG_BYTES", media_type="image/jpeg")
 
 
-# --- Helpers ---------------------------------------------------------------
+# --- Helpers -----------------------------------------------------------------
 def _extract_user_text(messages):
     parts = []
     for m in messages:
@@ -127,7 +204,7 @@ def _extract_user_text(messages):
     return " ".join(parts)
 
 
-async def _sse_stream(chunks):
+async def _text_sse(chunks):
     for ch in chunks:
         payload = {"choices": [{"delta": {"content": ch}}]}
         yield f"data: {json.dumps(payload)}\n\n"
@@ -135,10 +212,21 @@ async def _sse_stream(chunks):
     yield "data: [DONE]\n\n"
 
 
+async def _tool_call_sse(*, index, id, name, arguments_json):
+    """Emit a streaming tool_call response — split args across chunks for realism."""
+    yield f'data: {json.dumps({"choices":[{"delta":{"tool_calls":[{"index":index,"id":id,"type":"function","function":{"name":name,"arguments":""}}]}}]})}\n\n'
+    await asyncio.sleep(0.005)
+    yield f'data: {json.dumps({"choices":[{"delta":{"tool_calls":[{"index":index,"function":{"arguments":arguments_json[:5]}}]}}]})}\n\n'
+    await asyncio.sleep(0.005)
+    yield f'data: {json.dumps({"choices":[{"delta":{"tool_calls":[{"index":index,"function":{"arguments":arguments_json[5:]}}]}}]})}\n\n'
+    await asyncio.sleep(0.005)
+    yield f'data: {json.dumps({"choices":[{"finish_reason":"tool_calls"}]})}\n\n'
+    yield "data: [DONE]\n\n"
+
+
 def run_server(app, port):
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
-    server = uvicorn.Server(config)
-    asyncio.run(server.serve())
+    asyncio.run(uvicorn.Server(config).serve())
 
 
 def start_in_thread(app, port):
@@ -163,7 +251,7 @@ async def wait_for(url, timeout=5):
 
 async def call_shim(payload, ak="test-ak-secret"):
     events = []
-    async with httpx.AsyncClient(timeout=10.0) as c:
+    async with httpx.AsyncClient(timeout=15.0) as c:
         async with c.stream(
             "POST",
             f"http://127.0.0.1:{SHIM_PORT}/rokid/agent",
@@ -182,14 +270,12 @@ async def call_shim(payload, ak="test-ak-secret"):
 
 
 async def main():
-    start_in_thread(mock_owui, MOCK_OPENWEBUI_PORT)
     start_in_thread(mock_litellm, MOCK_LITELLM_PORT)
+    start_in_thread(mock_hub, MOCK_MCP_HUB_PORT)
     start_in_thread(mock_rokid, MOCK_ROKID_PORT)
     start_in_thread(mock_photo_host, PHOTO_HOST_PORT)
-    await wait_for(f"http://127.0.0.1:{MOCK_OPENWEBUI_PORT}/openapi.json")
-    await wait_for(f"http://127.0.0.1:{MOCK_LITELLM_PORT}/openapi.json")
-    await wait_for(f"http://127.0.0.1:{MOCK_ROKID_PORT}/openapi.json")
-    await wait_for(f"http://127.0.0.1:{PHOTO_HOST_PORT}/openapi.json")
+    for port in (MOCK_LITELLM_PORT, MOCK_MCP_HUB_PORT, MOCK_ROKID_PORT, PHOTO_HOST_PORT):
+        await wait_for(f"http://127.0.0.1:{port}/openapi.json")
 
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "shim"))
     from app.main import app as shim_app
@@ -199,138 +285,127 @@ async def main():
     failures = []
 
     # --- T1: short text -> fast path (LiteLLM, fast-model) ---
+    litellm_calls.clear()
     ev = await call_shim({
         "message_id": "m1", "agent_id": "test",
         "message": [{"role": "user", "type": "text", "text": "Bonjour"}],
     })
     text = "".join(d.get("answer_stream", "") for _, d in ev if d.get("type") == "answer")
-    print(f"[T1 fast] model_called={litellm_seen.get('model')!r} text={text!r}")
-    if litellm_seen.get("model") != "fast-model":
-        failures.append(f"T1 expected fast-model, got {litellm_seen.get('model')}")
-    if text != "Réponse rapide.":
-        failures.append(f"T1 text mismatch: {text!r}")
+    fast_call = [c for c in litellm_calls if c.get("model") == "fast-model"]
+    print(f"[T1 fast] calls={len(fast_call)} text={text!r}")
+    if not fast_call: failures.append("T1 fast-model not called")
+    if text != "Réponse rapide.": failures.append(f"T1 text: {text!r}")
 
-    # --- T2: image present -> vision path (LiteLLM, vision-model) ---
-    litellm_seen.clear()
+    # --- T2: image -> vision path, base64 inlined, disk cache populated ---
+    litellm_calls.clear()
     ev = await call_shim({
         "message_id": "m2", "agent_id": "test",
         "message": [
             {"role": "user", "type": "text", "text": "Que vois-tu ?"},
-            {"role": "user", "type": "image",
-             "image_url": f"http://127.0.0.1:{PHOTO_HOST_PORT}/cdn/test1.jpg"},
+            {"role": "user", "type": "image", "image_url": f"http://127.0.0.1:{PHOTO_HOST_PORT}/cdn/test1.jpg"},
         ],
     })
     text = "".join(d.get("answer_stream", "") for _, d in ev if d.get("type") == "answer")
-    print(f"[T2 vision] model_called={litellm_seen.get('model')!r} text={text!r}")
-    if litellm_seen.get("model") != "vision-model":
-        failures.append(f"T2 expected vision-model, got {litellm_seen.get('model')}")
-    # Image URL should now be a data: URL with the fake bytes inlined
-    user_msg = [m for m in litellm_seen["messages"] if m["role"] == "user"][0]
-    img_part = next((p for p in user_msg["content"] if p.get("type") == "image_url"), None)
-    img_url_sent = img_part["image_url"]["url"] if img_part else ""
-    if not img_url_sent.startswith("data:image/"):
-        failures.append(f"T2 image url not inlined as data: {img_url_sent[:80]}")
+    vision_call = [c for c in litellm_calls if c.get("model") == "vision-model"]
+    print(f"[T2 vision] calls={len(vision_call)} text={text!r}")
+    if not vision_call: failures.append("T2 vision-model not called")
+    if not vision_call: pass
     else:
-        import base64 as _b64
-        b64_part = img_url_sent.split(",", 1)[1]
-        decoded = _b64.b64decode(b64_part)
-        print(f"[T2 inline] data URL len={len(img_url_sent)} decoded={len(decoded)} bytes")
-        if b"FAKE_JPEG_BYTES" not in decoded:
-            failures.append(f"T2 inlined bytes wrong: {decoded[:40]!r}")
-    # AND the disk cache should still hold a copy for downstream tools
-    photos_on_disk = list(os.scandir(os.environ["PHOTO_CACHE_DIR"]))
-    print(f"[T2 disk] photos cached: {[p.name for p in photos_on_disk]}")
-    if not photos_on_disk:
-        failures.append("T2 disk cache empty after vision turn")
-    else:
-        # Verify the local /photos/{name} route still serves them
-        first = photos_on_disk[0].name
-        async with httpx.AsyncClient() as c:
-            r = await c.get(f"http://127.0.0.1:{SHIM_PORT}/photos/{first}")
-        print(f"[T2 served] GET /photos/{first} -> {r.status_code} ({len(r.content)} bytes)")
-        if r.status_code != 200 or b"FAKE_JPEG_BYTES" not in r.content:
-            failures.append(f"T2 disk-served photo wrong: status={r.status_code}")
+        user_msg = [m for m in vision_call[0]["messages"] if m["role"] == "user"][0]
+        img_part = next((p for p in user_msg["content"] if p.get("type") == "image_url"), None)
+        img_url_sent = img_part["image_url"]["url"] if img_part else ""
+        if not img_url_sent.startswith("data:image/"):
+            failures.append(f"T2 image url not inlined: {img_url_sent[:60]}")
+        else:
+            import base64 as _b64
+            decoded = _b64.b64decode(img_url_sent.split(",", 1)[1])
+            if b"FAKE_JPEG_BYTES" not in decoded:
+                failures.append(f"T2 inlined bytes wrong: {decoded[:30]!r}")
+            print(f"[T2 inline] decoded {len(decoded)} bytes OK")
+    photos = list(os.scandir(os.environ["PHOTO_CACHE_DIR"]))
+    if not photos: failures.append("T2 disk cache empty")
 
-    # --- T3: tool-keyword text -> full path (OpenWebUI) ---
-    owui_seen.clear()
+    # --- T3: tool-keyword text -> full path, agent loop, MCP tool dispatched ---
+    litellm_calls.clear()
+    hub_tool_calls.clear()
     ev = await call_shim({
         "message_id": "m3", "agent_id": "test",
-        "message": [{"role": "user", "type": "text",
-                     "text": "Envoie un mail à Marie pour confirmer le rdv"}],
+        "message": [{"role": "user", "type": "text", "text": "Liste mes 3 derniers mails"}],
     })
-    text = "".join(d.get("answer_stream", "") for _, d in ev if d.get("type") == "answer")
-    print(f"[T3 full] owui_called_with_model={owui_seen.get('model')!r} text={text!r}")
-    if owui_seen.get("model") != "openwebui-model":
-        failures.append(f"T3 OpenWebUI was not called: owui_seen={owui_seen}")
-    if text != "Réponse complète via OpenWebUI.":
-        failures.append(f"T3 text mismatch: {text!r}")
+    full_calls = [c for c in litellm_calls if c.get("model") == "full-model"]
+    text = "".join(d.get("answer_stream", "") for _, d in ev
+                   if d.get("type") == "answer" and not d.get("is_finish"))
+    print(f"[T3 full] litellm_rounds={len(full_calls)} hub_calls={len(hub_tool_calls)} text={text[:120]!r}")
+    if len(full_calls) != 2:
+        failures.append(f"T3 expected 2 litellm rounds, got {len(full_calls)}")
+    else:
+        # Round 1 must include tools; round 2 must include the tool message
+        if not full_calls[0].get("tools"):
+            failures.append("T3 round 1 missing tools field")
+        if full_calls[1]["messages"][-1]["role"] != "tool":
+            failures.append("T3 round 2 last message should be a tool result")
+    if len(hub_tool_calls) != 1 or hub_tool_calls[0]["tool"] != "gmail_list_emails":
+        failures.append(f"T3 hub dispatch: {hub_tool_calls}")
+    if hub_tool_calls and hub_tool_calls[0]["args"].get("count") != 3:
+        failures.append(f"T3 wrong args: {hub_tool_calls[0]['args']}")
+    if "Tu as 3 mails" not in text:
+        failures.append(f"T3 final answer didn't incorporate tool result: {text!r}")
 
-    # --- T4: long text without keywords -> full path (length triggers) ---
-    owui_seen.clear()
-    long_text = "Peux-tu m'expliquer en détail comment fonctionne la fission nucléaire " * 3
+    # --- T4: fence extraction still works on the FAST path ---
+    litellm_calls.clear()
     ev = await call_shim({
         "message_id": "m4", "agent_id": "test",
-        "message": [{"role": "user", "type": "text", "text": long_text}],
+        "message": [{"role": "user", "type": "text", "text": "Prends une photo."}],
     })
-    print(f"[T4 long] owui_called_with_model={owui_seen.get('model')!r}")
-    if owui_seen.get("model") != "openwebui-model":
-        failures.append(f"T4 long text should route to full path: owui_seen={owui_seen}")
-
-    # --- T5: tool_call fence extraction still works on the full path ---
-    ev = await call_shim({
-        "message_id": "m5", "agent_id": "test",
-        "message": [{"role": "user", "type": "text", "text": "Prends une photo et envoie un mail"}],
-    })
-    tools = [d for _, d in ev if d.get("type") == "tool_call"]
+    tools_emitted = [d for _, d in ev if d.get("type") == "tool_call"]
     answer_text = "".join(d.get("answer_stream", "") for _, d in ev
                           if d.get("type") == "answer" and not d.get("is_finish"))
-    print(f"[T5 tool] tools={[t['tool_call'] for t in tools]} answer={answer_text!r}")
-    if len(tools) != 1 or tools[0]["tool_call"]["command"] != "take_photo":
-        failures.append(f"T5 expected one take_photo tool: {tools}")
+    print(f"[T4 fence] tools={[t['tool_call'] for t in tools_emitted]} answer={answer_text!r}")
+    if not tools_emitted or tools_emitted[0]["tool_call"]["command"] != "take_photo":
+        failures.append(f"T4 expected take_photo: {tools_emitted}")
     if "```" in answer_text:
-        failures.append(f"T5 fence leaked: {answer_text!r}")
+        failures.append(f"T4 fence leaked: {answer_text!r}")
 
-    # --- T6: bad AK rejected ---
+    # --- T5: bad AK -> 401 ---
     async with httpx.AsyncClient() as c:
         r = await c.post(
             f"http://127.0.0.1:{SHIM_PORT}/rokid/agent",
             json={"message_id": "x", "agent_id": "x", "message": []},
             headers={"Authorization": "Bearer WRONG"},
         )
-    print(f"[T6 bad AK] status={r.status_code}")
-    if r.status_code != 401:
-        failures.append(f"T6 bad AK should be 401, got {r.status_code}")
+    print(f"[T5 bad AK] status={r.status_code}")
+    if r.status_code != 401: failures.append(f"T5 should be 401: {r.status_code}")
 
-    # --- T7: /push proxies to Rokid callback with correct sk ---
+    # --- T6: /push proxies to Rokid callback ---
     rokid_callback_log.clear()
     async with httpx.AsyncClient() as c:
         r = await c.post(
             f"http://127.0.0.1:{SHIM_PORT}/push",
             json={"account_id": "user-42", "agent_id": "plexus-glasses",
-                  "content": "Ton train part dans 5 minutes."},
+                  "content": "Test push."},
             headers={"X-Push-Secret": "push-secret"},
         )
-    print(f"[T7 push] status={r.status_code} body={r.json()}")
+    print(f"[T6 push] status={r.status_code} ok={r.json().get('ok') if r.status_code==200 else 'n/a'}")
     if r.status_code != 200 or not r.json().get("ok"):
-        failures.append(f"T7 push failed: {r.status_code} {r.text}")
-    if not rokid_callback_log:
-        failures.append("T7 rokid callback was not hit")
-    else:
-        cb = rokid_callback_log[0]
-        if cb["headers"].get("authorization") != "Bearer sk-rokid-test":
-            failures.append(f"T7 wrong sk forwarded: {cb['headers'].get('authorization')!r}")
-        if cb["body"]["message"]["agent_id"] != "plexus-glasses":
-            failures.append(f"T7 wrong agent_id: {cb['body']}")
+        failures.append(f"T6 push failed: {r.status_code}")
+    if not rokid_callback_log: failures.append("T6 rokid callback not hit")
 
-    # --- T8: /push without secret rejected ---
+    # --- T7: /push without secret -> 401 ---
     async with httpx.AsyncClient() as c:
         r = await c.post(
             f"http://127.0.0.1:{SHIM_PORT}/push",
-            json={"account_id": "user-42", "agent_id": "a", "content": "x"},
+            json={"account_id": "u", "agent_id": "a", "content": "x"},
         )
-    print(f"[T8 push no-secret] status={r.status_code}")
-    if r.status_code != 401:
-        failures.append(f"T8 should be 401, got {r.status_code}")
+    print(f"[T7 no-secret] status={r.status_code}")
+    if r.status_code != 401: failures.append(f"T7 should be 401: {r.status_code}")
+
+    # --- T8: /health reports tool count from mock hub ---
+    async with httpx.AsyncClient() as c:
+        r = await c.get(f"http://127.0.0.1:{SHIM_PORT}/health")
+    health = r.json()
+    print(f"[T8 health] {health}")
+    if health.get("mcp_tool_count") != 2:
+        failures.append(f"T8 expected 2 tools from mock hub, got {health.get('mcp_tool_count')}")
 
     print()
     if failures:

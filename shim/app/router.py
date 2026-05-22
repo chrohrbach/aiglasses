@@ -2,18 +2,18 @@
 
 Three paths:
     - "vision": request contains at least one image item → direct to LiteLLM
-                with a vision-capable model.
+                with a vision-capable model. No MCP tools.
     - "fast":   short text-only request that doesn't hint at MCP tool usage →
                 direct to LiteLLM with a small/fast EU model. No OpenWebUI hop.
-    - "full":   anything else → through OpenWebUI (gets the full MCP tool
-                fanout, RAG, etc.).
+    - "full":   anything else → through agent_loop with MCP tools wired in.
 """
 
 import os
 from collections.abc import AsyncIterator
 from typing import Literal
 
-from . import litellm_client, openwebui_client
+from . import agent_loop, litellm_client
+from .mcp_tools import McpToolCatalog
 from .rokid_types import RokidRequest
 
 Path = Literal["vision", "fast", "full"]
@@ -71,7 +71,12 @@ def pick_path(req: RokidRequest) -> Path:
     return "full"
 
 
-async def stream_for_path(path: Path, messages: list[dict]) -> AsyncIterator[str]:
+async def stream_for_path(
+    path: Path,
+    messages: list[dict],
+    *,
+    catalog: McpToolCatalog,
+) -> AsyncIterator[str]:
     if path == "vision":
         async for chunk in litellm_client.stream_chat(messages, model=litellm_client.VISION_MODEL):
             yield chunk
@@ -79,5 +84,9 @@ async def stream_for_path(path: Path, messages: list[dict]) -> AsyncIterator[str
         async for chunk in litellm_client.stream_chat(messages, model=litellm_client.FAST_MODEL):
             yield chunk
     else:
-        async for chunk in openwebui_client.stream_chat(messages):
+        async for chunk in agent_loop.stream_with_tools(
+            messages,
+            model=litellm_client.FULL_MODEL,
+            catalog=catalog,
+        ):
             yield chunk
