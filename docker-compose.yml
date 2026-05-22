@@ -18,7 +18,11 @@ services:
       - LITELLM_TEMPERATURE=${LITELLM_TEMPERATURE:-0.4}
       - ROKID_FAST_MODEL=${ROKID_FAST_MODEL:-infomaniak-ministral}
       - ROKID_VISION_MODEL=${ROKID_VISION_MODEL:-purpose-vision}
-      - ROKID_FULL_MODEL=${ROKID_FULL_MODEL:-purpose-tool-calling}
+      # Default = claude-haiku-4-5 (OpenRouter Anthropic). Faster + tighter
+      # variance than the Swiss purpose-tool-calling (Gemma-4 31B) on tool
+      # selection, at the cost of leaving CH. Override with purpose-tool-calling
+      # if data sovereignty matters more than ~1s of latency.
+      - ROKID_FULL_MODEL=${ROKID_FULL_MODEL:-claude-haiku-4-5}
       - ROKID_FAST_MAX_CHARS=${ROKID_FAST_MAX_CHARS:-120}
       # --- mcp-hub for the full path's tool fanout ---
       - MCP_HUB_URL=${MCP_HUB_URL:-http://mcp-hub:8012}
