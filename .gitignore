@@ -29,3 +29,4 @@ rokid_*.html
 rokid_*.json
 rokid_*.txt
 api_test*.json
+.depot-cache/
