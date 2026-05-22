@@ -8,12 +8,33 @@ services:
     ports:
       - "8024:8000"
     environment:
+      # --- Rokid side ---
       - ROKID_AK=${ROKID_AK}
+      - ROKID_CALLBACK_URL=${ROKID_CALLBACK_URL:-}
+      - ROKID_SK_TOKEN=${ROKID_SK_TOKEN:-}
+      # --- OpenWebUI backend (full path) ---
       - OPENWEBUI_URL=${OPENWEBUI_URL:-http://openwebui:8080}
       - OPENWEBUI_API_KEY=${OPENWEBUI_API_KEY}
-      - OPENWEBUI_MODEL=${OPENWEBUI_MODEL:-anthropic/claude-sonnet-4-6}
+      - OPENWEBUI_MODEL=${OPENWEBUI_MODEL:-purpose-tool-calling}
       - OPENWEBUI_TEMPERATURE=${OPENWEBUI_TEMPERATURE:-0.4}
+      # --- LiteLLM backend (fast + vision paths) ---
+      - LITELLM_URL=${LITELLM_URL:-http://litellm:4000/v1}
+      - LITELLM_API_KEY=${LITELLM_API_KEY:-sk-anything}
+      - LITELLM_TEMPERATURE=${LITELLM_TEMPERATURE:-0.4}
+      - ROKID_FAST_MODEL=${ROKID_FAST_MODEL:-infomaniak-ministral}
+      - ROKID_VISION_MODEL=${ROKID_VISION_MODEL:-purpose-vision}
+      - ROKID_FAST_MAX_CHARS=${ROKID_FAST_MAX_CHARS:-120}
+      # --- Photo cache ---
+      - PHOTO_CACHE_DIR=/app/data/photos
+      - PHOTOS_PUBLIC_URL=${PHOTOS_PUBLIC_URL:-http://rokid-shim:8000}
+      - PHOTO_RETENTION_HOURS=${PHOTO_RETENTION_HOURS:-48}
+      - PHOTO_MAX_BYTES=${PHOTO_MAX_BYTES:-10485760}
+      # --- Push endpoint ---
+      - PUSH_SHARED_SECRET=${PUSH_SHARED_SECRET:-}
+      # --- Misc ---
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - photo_cache:/app/data
     networks:
       - mcp-network
     logging:
@@ -21,6 +42,9 @@ services:
       options:
         max-size: "20m"
         max-file: "3"
+
+volumes:
+  photo_cache:
 
 networks:
   mcp-network:

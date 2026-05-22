@@ -27,18 +27,64 @@ Full spec extracted from the official Rokid Yuque doc and saved at
 
 ```
 Rokid Glasses ──POST /rokid/agent──► rokid-shim (FastAPI, :8024)
-                                          │
-                                          │ POST /api/chat/completions (stream)
-                                          ▼
-                                     OpenWebUI ──► LiteLLM ──► Infomaniak / OpenRouter
-                                          │
-                                          └──► 12 MCP tool servers (Office, Gmail, Knowledge, ...)
+                                         │
+                                         │  router.pick_path(req)
+                                         │     ├─ image in payload   ──► VISION  ──► LiteLLM (purpose-vision)
+                                         │     ├─ short + no keyword ──► FAST    ──► LiteLLM (infomaniak-ministral)
+                                         │     └─ otherwise           ──► FULL    ──► OpenWebUI
+                                         │                                            │
+                                         │                                            └─► 12 MCP tool servers
+                                         │
+                                         ├──► POST /push   (async push back to glasses via Rokid /metis/callback/message)
+                                         └──► GET  /photos/{hash}  (serves cached camera frames)
 ```
 
 The shim is deployed on the same Proxmox LXC as `mcp-servers/` and joins the
 existing `mcp-network` Docker network. Caddy on the LXC routes
 `glasses.rohrbach.app` to the shim; Cloudflare Tunnel exposes that hostname
 publicly with valid TLS so Rokid accepts it.
+
+### Routing rules
+
+| Trigger | Path | Model | Why |
+|---|---|---|---|
+| Any `image_url` item in `message[]` | vision | `ROKID_VISION_MODEL` (default `purpose-vision`) | OpenWebUI multimodal tool fanout is overkill for "what is this?" — direct LiteLLM is faster |
+| Last user text ≤ `ROKID_FAST_MAX_CHARS` chars AND no tool-hint keyword | fast | `ROKID_FAST_MODEL` (default `infomaniak-ministral`) | Sub-second TTFT for voice via Swiss-AI |
+| Anything else | full | `OPENWEBUI_MODEL` (default `purpose-tool-calling` → `infomaniak-gemma4`) | OpenWebUI dispatches MCP tools as needed |
+
+Tool-hint keywords are in [`shim/app/router.py`](shim/app/router.py)
+(`_TOOL_HINT_KEYWORDS`) — French + English mix covering mail, calendar,
+contacts, smart home, knowledge, github, tasks, web search.
+
+### Photo cache
+
+Rokid serves camera frames from its own CDN with short-lived URLs. The shim
+downloads each `image_url` once into a persistent volume and rewrites the
+in-memory request so the model sees `${PHOTOS_PUBLIC_URL}/photos/<sha>.<ext>`
+instead. Benefits:
+
+- Photos remain reachable for later turns and downstream tools
+  (e.g. attach to email via mcp-gmail).
+- The model fetches from inside `mcp-network` rather than out to Rokid,
+  saving a hop.
+- Configurable retention (`PHOTO_RETENTION_HOURS`, default 48h).
+
+### Async push
+
+`POST /push` on the shim forwards to Rokid's `/metis/callback/message`
+endpoint, letting any in-cluster service (n8n, mcp-tasks, custom cron)
+push a proactive message to the glasses. Auth via `X-Push-Secret`
+header (configurable in `.env`). The `sk` token used against Rokid is
+the `ROKID_SK_TOKEN` generated once at
+<https://account-web.rokid.com/token>.
+
+Example trigger from inside the LXC:
+```bash
+curl -X POST http://rokid-shim:8000/push \
+  -H "X-Push-Secret: $PUSH_SHARED_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"account_id":"<rokid-user-id>","agent_id":"plexus-glasses","content":"Ton train part dans 5 min."}'
+```
 
 ## Files
 
@@ -47,17 +93,21 @@ shim/
 ├── Dockerfile
 ├── requirements.txt
 └── app/
-    ├── main.py              FastAPI app, /rokid/agent + /health
+    ├── main.py              FastAPI app — /rokid/agent + /push + /photos/{name} + /health
     ├── rokid_types.py       Pydantic models for the Rokid contract
-    ├── translator.py        Rokid message[] → OpenAI messages[] + system prompt
-    ├── openwebui_client.py  Async streaming client for OpenWebUI
+    ├── translator.py        Rokid message[] -> OpenAI messages[] + system prompt
+    ├── router.py            Decide fast / vision / full per request
+    ├── openwebui_client.py  Async streaming client for the "full" path
+    ├── litellm_client.py    Async streaming client for the "fast" + "vision" paths
+    ├── photo_cache.py       Download Rokid camera frames, expose locally
+    ├── rokid_callback.py    POST to Rokid /metis/callback/message
     └── tool_extractor.py    Parse fenced ```rokid_action JSON from LLM output
 
 deploy/
 └── glasses_hostname.caddyfile   Caddy site block, drop into mcp-servers/deploy-local/local-caddy/sites/
 
-docker-compose.yml          Joins mcp-network external, exposes :8024
-.env.example                ROKID_AK, OPENWEBUI_*, MODEL
+docker-compose.yml          Joins mcp-network external, exposes :8024, photo_cache volume
+.env.example                ROKID_*, OPENWEBUI_*, LITELLM_*, PHOTOS_*, PUSH_*
 ```
 
 ## Deploy (LXC 500)
@@ -154,10 +204,19 @@ uvicorn app.main:app --reload --port 8024
 
 ## Integration test
 
-`integration_test.py` at the repo root spins up an in-process mock OpenWebUI,
-runs the shim against it, and asserts the SSE flow (plain text, photo
-tool_call, multimodal image input, bad-AK rejection, device-context
-injection). Run it after any change to the shim:
+`integration_test.py` at the repo root spins up four mock servers in-process
+(OpenWebUI, LiteLLM, Rokid callback, and a fake camera-frame CDN), runs the
+shim against them, and asserts the full v2 flow:
+
+1. Short text → fast path hits LiteLLM with the fast model
+2. Image present → vision path hits LiteLLM with the vision model, and the
+   image URL is rewritten to the local `/photos/<sha>` cache
+3. Tool-keyword text → full path hits OpenWebUI
+4. Long text without keywords → full path
+5. Fenced `rokid_action` extraction works end-to-end on the full path
+6. Bad AK is rejected (401)
+7. `POST /push` proxies correctly to Rokid's callback with the sk token
+8. `POST /push` without the shared secret is rejected (401)
 
 ```bash
 python integration_test.py
