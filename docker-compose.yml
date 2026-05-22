@@ -1,0 +1,28 @@
+services:
+  rokid-shim:
+    build:
+      context: ./shim
+      dockerfile: Dockerfile
+    container_name: rokid-shim
+    restart: unless-stopped
+    ports:
+      - "8024:8000"
+    environment:
+      - ROKID_AK=${ROKID_AK}
+      - OPENWEBUI_URL=${OPENWEBUI_URL:-http://openwebui:8080}
+      - OPENWEBUI_API_KEY=${OPENWEBUI_API_KEY}
+      - OPENWEBUI_MODEL=${OPENWEBUI_MODEL:-anthropic/claude-sonnet-4-6}
+      - OPENWEBUI_TEMPERATURE=${OPENWEBUI_TEMPERATURE:-0.4}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    networks:
+      - mcp-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+networks:
+  mcp-network:
+    external: true
+    name: mcp-network

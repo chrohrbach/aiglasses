@@ -1,0 +1,25 @@
+# Drop this file into mcp-servers/deploy-local/local-caddy/sites/ on the
+# Plexus host (LXC 500). The base Caddyfile imports
+# /etc/caddy/local/sites/*.caddyfile automatically. Then add a matching
+# Cloudflare Tunnel entry pointing glasses.rohrbach.app → LXC 500 :80.
+#
+# Rokid POSTs SSE requests here. No CORS is needed (server-to-server call,
+# no browser preflight). No `plexus_routes` import either — this hostname
+# exposes only the shim.
+glasses.rohrbach.app:80 {
+    handle /health {
+        reverse_proxy rokid-shim:8000
+    }
+    handle /rokid/agent {
+        reverse_proxy rokid-shim:8000 {
+            # Disable buffering so SSE chunks reach Rokid as they're emitted.
+            flush_interval -1
+            transport http {
+                response_header_timeout 5m
+            }
+        }
+    }
+    handle {
+        respond "Rokid agent shim. POST to /rokid/agent." 200
+    }
+}
