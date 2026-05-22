@@ -9,6 +9,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app /app/app
 
+# Pre-create the volume mount target with the right ownership so the named
+# volume (photo_cache) inherits it on first mount. Without this, /app/data
+# ends up root-owned and shimuser can't create the photos subdir.
+RUN mkdir -p /app/data/photos && chown -R shimuser:shimuser /app/data
+
 USER shimuser
 
 EXPOSE 8000
