@@ -9,6 +9,7 @@ Endpoints:
 Rokid contract:  https://rokid.yuque.com/ub8h5n/hth52o/qq4gs616xz4ellh1
 """
 
+import asyncio
 import logging
 import os
 
@@ -51,6 +52,16 @@ else:
 
 app = FastAPI(title="Rokid → Plexus shim")
 catalog = McpToolCatalog()
+
+_catalogs_cache: dict[str | None, McpToolCatalog] = {}
+_catalogs_lock = asyncio.Lock()
+
+
+async def get_catalog_for_user(user_id: str | None) -> McpToolCatalog:
+    async with _catalogs_lock:
+        if user_id not in _catalogs_cache:
+            _catalogs_cache[user_id] = McpToolCatalog(user_id=user_id)
+        return _catalogs_cache[user_id]
 
 
 @app.get("/health")
@@ -125,11 +136,13 @@ async def rokid_agent(
         len(messages),
     )
 
+    req_catalog = await get_catalog_for_user(req.user_id)
+
     async def event_stream():
         pending_tool: dict | None = None
         try:
             async for part in split_stream(
-                router.stream_for_path(path, messages, catalog=catalog)
+                router.stream_for_path(path, messages, catalog=req_catalog)
             ):
                 if part.kind == "text" and part.text:
                     yield RokidEventPayload(

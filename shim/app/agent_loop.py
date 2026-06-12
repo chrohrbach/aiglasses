@@ -13,6 +13,7 @@ the background. When the round ends:
 A safety cap of `max_rounds` prevents runaway loops.
 """
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -87,8 +88,9 @@ async def stream_with_tools(
         convo.append(assistant_msg)
         logger.info("round %d tool_calls=%s", round_idx, [tc["name"] for tc in tool_calls])
 
-        # Dispatch each tool call and append its result as a tool message.
-        for assistant_tc, raw in zip(assistant_msg["tool_calls"], tool_calls, strict=True):
+        # Dispatch tool calls in parallel!
+        parsed_calls = []
+        for raw in tool_calls:
             name = raw["name"] or ""
             try:
                 args = json.loads(raw["arguments"]) if raw["arguments"] else {}
@@ -97,7 +99,12 @@ async def stream_with_tools(
             except json.JSONDecodeError:
                 args = {}
                 logger.warning("round %d tool %s sent malformed JSON args: %r", round_idx, name, raw["arguments"])
-            result = await catalog.dispatch(name, args)
+            parsed_calls.append((name, args))
+
+        tasks = [catalog.dispatch(name, args) for name, args in parsed_calls]
+        results = await asyncio.gather(*tasks)
+
+        for assistant_tc, result in zip(assistant_msg["tool_calls"], results, strict=True):
             convo.append({
                 "role": "tool",
                 "tool_call_id": assistant_tc["id"],

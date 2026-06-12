@@ -78,8 +78,19 @@ def _data_url_from_path(path: Path) -> str:
     return f"data:{mime};base64,{b64}"
 
 
+_in_memory_cache: dict[str, str] = {}
+
+
+def _write_to_disk_bg(path: Path, content: bytes) -> None:
+    try:
+        path.write_bytes(content)
+        logger.info("Saved image to disk in background: %s", path)
+    except Exception as e:
+        logger.warning("Failed to write image to disk in background: %s", e)
+
+
 async def _cache_one(url: str) -> str | None:
-    """Cache an image to disk and return the URL the model should fetch.
+    """Cache an image and return the URL the model should fetch.
 
     The returned URL is either a `data:...;base64,...` (default — works for
     any model backend) or a public `/photos/<name>` URL (when
@@ -87,11 +98,23 @@ async def _cache_one(url: str) -> str | None:
     """
     sha = hashlib.sha256(url.encode("utf-8")).hexdigest()[:24]
 
-    # Reuse if already cached
+    # 1. Check in-memory cache first (super fast, no disk I/O)
+    if sha in _in_memory_cache:
+        cached_url = _in_memory_cache[sha]
+        if PHOTO_INLINE_BASE64 and cached_url.startswith("data:"):
+            return cached_url
+        elif not PHOTO_INLINE_BASE64 and not cached_url.startswith("data:"):
+            return cached_url
+
+    # 2. Check if already on disk
     for existing in PHOTO_DIR.glob(f"{sha}.*"):
         if PHOTO_INLINE_BASE64:
-            return _data_url_from_path(existing)
-        return _public_url_for(existing.name)
+            data_url = _data_url_from_path(existing)
+            _in_memory_cache[sha] = data_url
+            return data_url
+        public_url = _public_url_for(existing.name)
+        _in_memory_cache[sha] = public_url
+        return public_url
 
     # data: URLs we received directly — just hand them back, nothing to cache
     if url.startswith("data:"):
@@ -109,9 +132,16 @@ async def _cache_one(url: str) -> str | None:
             return None
         ext = _ext_from_url_or_mime(url, resp.headers.get("content-type"))
         path = PHOTO_DIR / f"{sha}.{ext}"
-        path.write_bytes(resp.content)
+        
+        # Schedule the disk write in a background thread so we don't block the main event loop
+        asyncio.create_task(asyncio.to_thread(_write_to_disk_bg, path, resp.content))
+
         if PHOTO_INLINE_BASE64:
-            return _data_url_from_path(path)
+            mime = _EXT_TO_MIME.get(ext.lower(), "application/octet-stream")
+            b64 = base64.b64encode(resp.content).decode("ascii")
+            data_url = f"data:{mime};base64,{b64}"
+            _in_memory_cache[sha] = data_url
+            return data_url
         return _public_url_for(path.name)
     except Exception as e:
         logger.warning("failed to cache image %s: %s", url, e)
@@ -145,9 +175,17 @@ def cleanup_old(now: float | None = None) -> int:
 
 def get_path(name: str) -> Path | None:
     """Resolve a /photos/{name} lookup safely (no path traversal)."""
-    if "/" in name or "\\" in name or name.startswith(".") or len(name) > 80:
+    if len(name) > 80:
         return None
-    p = PHOTO_DIR / name
-    if not p.is_file():
+    try:
+        resolved_dir = PHOTO_DIR.resolve()
+        p = (PHOTO_DIR / name).resolve()
+        if not p.is_file():
+            return None
+        # Ensure the resolved file path is inside the resolved directory
+        # Using commonpath is extremely robust on both Windows and Linux
+        if os.path.commonpath([resolved_dir, p]) != str(resolved_dir):
+            return None
+        return p
+    except Exception:
         return None
-    return p

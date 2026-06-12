@@ -96,9 +96,15 @@ class McpToolCatalog:
         auth_token: str = MCP_HUB_AUTH_TOKEN,
         cache_ttl: int = MCP_TOOLS_CACHE_TTL,
         timeout: float = MCP_TOOL_TIMEOUT,
+        user_id: str | None = None,
     ):
         self.hub_url = hub_url.rstrip("/")
-        self.profiles = profiles or list(ROKID_MCP_PROFILES)
+        self.user_id = user_id
+        base_profiles = profiles or list(ROKID_MCP_PROFILES)
+        if user_id:
+            self.profiles = [f"{user_id}_{p}" for p in base_profiles]
+        else:
+            self.profiles = base_profiles
         self.auth_token = auth_token
         self.cache_ttl = cache_ttl
         self.timeout = timeout
