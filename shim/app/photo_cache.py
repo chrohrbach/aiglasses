@@ -71,6 +71,13 @@ def _public_url_for(name: str) -> str:
     return f"{PHOTOS_PUBLIC_URL}/photos/{name}"
 
 
+def _archive_url_for_sha(sha: str) -> str | None:
+    """Stable public /photos/<name> URL for a cached photo, if a disk copy exists."""
+    for existing in PHOTO_DIR.glob(f"{sha}.*"):
+        return _public_url_for(existing.name)
+    return None
+
+
 def _data_url_from_path(path: Path) -> str:
     ext = path.suffix.lstrip(".").lower()
     mime = _EXT_TO_MIME.get(ext, "application/octet-stream")
@@ -89,12 +96,18 @@ def _write_to_disk_bg(path: Path, content: bytes) -> None:
         logger.warning("Failed to write image to disk in background: %s", e)
 
 
-async def _cache_one(url: str) -> str | None:
-    """Cache an image and return the URL the model should fetch.
+async def _cache_one(url: str) -> tuple[str | None, str | None]:
+    """Cache an image and return ``(model_url, archive_url)``.
 
-    The returned URL is either a `data:...;base64,...` (default — works for
-    any model backend) or a public `/photos/<name>` URL (when
-    PHOTO_INLINE_BASE64 is false).
+    ``model_url`` is what the model should fetch — either a
+    ``data:...;base64,...`` URL (default, works for any backend) or a public
+    ``/photos/<name>`` URL (when PHOTO_INLINE_BASE64 is false). It is ``None``
+    when caching fails.
+
+    ``archive_url`` is the stable public ``/photos/<name>`` URL backed by the
+    durable disk copy, suitable for handing to ``attach_asset`` (mcp-memory
+    fetches it server-side). It is ``None`` when there is no disk copy (e.g. a
+    ``data:`` URL supplied directly by the caller).
     """
     sha = hashlib.sha256(url.encode("utf-8")).hexdigest()[:24]
 
@@ -102,23 +115,24 @@ async def _cache_one(url: str) -> str | None:
     if sha in _in_memory_cache:
         cached_url = _in_memory_cache[sha]
         if PHOTO_INLINE_BASE64 and cached_url.startswith("data:"):
-            return cached_url
+            return cached_url, _archive_url_for_sha(sha)
         elif not PHOTO_INLINE_BASE64 and not cached_url.startswith("data:"):
-            return cached_url
+            return cached_url, _archive_url_for_sha(sha)
 
     # 2. Check if already on disk
     for existing in PHOTO_DIR.glob(f"{sha}.*"):
+        archive_url = _public_url_for(existing.name)
         if PHOTO_INLINE_BASE64:
             data_url = _data_url_from_path(existing)
             _in_memory_cache[sha] = data_url
-            return data_url
-        public_url = _public_url_for(existing.name)
-        _in_memory_cache[sha] = public_url
-        return public_url
+            return data_url, archive_url
+        _in_memory_cache[sha] = archive_url
+        return archive_url, archive_url
 
     # data: URLs we received directly — just hand them back, nothing to cache
+    # and no stable archive URL (we never wrote it to disk).
     if url.startswith("data:"):
-        return url
+        return url, None
 
     try:
         # Many CDNs (Wikimedia, some commercial ones) reject the default httpx UA.
@@ -129,34 +143,49 @@ async def _cache_one(url: str) -> str | None:
         resp.raise_for_status()
         if len(resp.content) > PHOTO_MAX_BYTES:
             logger.warning("photo %s exceeds max bytes (%d), skipped", sha, len(resp.content))
-            return None
+            return None, None
         ext = _ext_from_url_or_mime(url, resp.headers.get("content-type"))
         path = PHOTO_DIR / f"{sha}.{ext}"
-        
-        # Schedule the disk write in a background thread so we don't block the main event loop
-        asyncio.create_task(asyncio.to_thread(_write_to_disk_bg, path, resp.content))
+
+        # Write the disk copy synchronously (in a thread) BEFORE advertising the
+        # archive URL, so mcp-memory can fetch it immediately when the model
+        # calls attach_asset within the same turn.
+        await asyncio.to_thread(_write_to_disk_bg, path, resp.content)
+        archive_url = _public_url_for(path.name)
 
         if PHOTO_INLINE_BASE64:
             mime = _EXT_TO_MIME.get(ext.lower(), "application/octet-stream")
             b64 = base64.b64encode(resp.content).decode("ascii")
             data_url = f"data:{mime};base64,{b64}"
             _in_memory_cache[sha] = data_url
-            return data_url
-        return _public_url_for(path.name)
+            return data_url, archive_url
+        _in_memory_cache[sha] = archive_url
+        return archive_url, archive_url
     except Exception as e:
         logger.warning("failed to cache image %s: %s", url, e)
-        return None
+        return None, None
 
 
-async def cache_request_images(req: RokidRequest) -> None:
-    """Walk the request, replacing image_url fields with cached local URLs."""
+async def cache_request_images(req: RokidRequest) -> list[str]:
+    """Walk the request, replacing image_url fields with cached local URLs.
+
+    Returns the list of stable public archive URLs
+    (``${PHOTOS_PUBLIC_URL}/photos/<sha>.<ext>``) for the images that were
+    persisted to disk — callers may advertise these to the model so it can pass
+    them verbatim to ``attach_asset``. Callers that ignore the return value keep
+    working unchanged; the in-request ``image_url`` rewrite is unaffected.
+    """
     image_items = [m for m in req.message if m.type == "image" and m.image_url]
     if not image_items:
-        return
+        return []
     results = await asyncio.gather(*(_cache_one(item.image_url) for item in image_items))
-    for item, new_url in zip(image_items, results, strict=True):
-        if new_url:
-            item.image_url = new_url
+    archive_urls: list[str] = []
+    for item, (model_url, archive_url) in zip(image_items, results, strict=True):
+        if model_url:
+            item.image_url = model_url
+        if archive_url:
+            archive_urls.append(archive_url)
+    return archive_urls
 
 
 def cleanup_old(now: float | None = None) -> int:

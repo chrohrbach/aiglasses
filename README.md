@@ -35,6 +35,7 @@ official Rokid Yuque doc
 Rokid Glasses ──POST /rokid/agent──► rokid-shim (FastAPI, :8024)
                                          │
                                          │  router.pick_path(req)
+                                         │     ├─ image + memory kw  ──► FULL   ──► agent_loop + tools (remember + attach_asset)
                                          │     ├─ image in payload   ──► VISION ──► LiteLLM (ROKID_VISION_MODEL)
                                          │     ├─ short + no keyword ──► FAST   ──► LiteLLM (ROKID_FAST_MODEL)
                                          │     └─ otherwise           ──► FULL   ──► agent_loop ──► LiteLLM (ROKID_FULL_MODEL)
@@ -61,9 +62,25 @@ publicly with valid TLS so Rokid accepts it.
 
 | Trigger | Path | Model | Why |
 |---|---|---|---|
-| Any `image_url` item in `message[]` | vision | `ROKID_VISION_MODEL` (default `purpose-vision`) | Direct LiteLLM vision call — no tool fanout needed for "what is this?" |
+| Image + a memory-intent keyword (`souviens`, `mémorise`, `archive`, `remember`, `save this photo`, …) | full | `ROKID_VISION_TOOL_MODEL` (default = `ROKID_FULL_MODEL`) | Needs the tool fleet (`remember` + `attach_asset`) to archive the photo into mcp-memory, with a vision-capable model so it can also see the shot |
+| Any other `image_url` item in `message[]` | vision | `ROKID_VISION_MODEL` (default `purpose-vision`) | Direct LiteLLM vision call — no tool fanout needed for "what is this?" |
 | Last user text ≤ `ROKID_FAST_MAX_CHARS` chars AND no tool-hint keyword | fast | `ROKID_FAST_MODEL` (default `infomaniak-ministral`) | Sub-second TTFT for voice via Swiss-AI |
 | Anything else | full | `ROKID_FULL_MODEL` (default `claude-haiku-4-5`) | Agent loop dispatches MCP tools via `mcp-hub` as needed |
+
+Memory-intent keywords are in [`shim/app/router.py`](shim/app/router.py)
+(`_MEMORY_INTENT_KEYWORDS`).
+
+#### Memory photo-capture flow
+
+When the user says e.g. *"souviens-toi de cette photo avec la famille au chalet"*
+while a camera frame is attached, the shim routes to the **full** path. The photo
+is persisted to disk and its stable archive URL (`${PHOTOS_PUBLIC_URL}/photos/<sha>.<ext>`,
+~48h retention) is injected into the system context. The agent then archives it
+into mcp-memory in two steps: `remember(type="memories", …)` to create the memory,
+then `attach_asset(memory_id=<id>, url=<archive URL>, caption=<description>)` —
+mcp-memory fetches the URL server-side, copies the bytes durably, and the caption
+makes the photo searchable. The model passes the archive URL verbatim (it never
+sees it otherwise — it only gets the base64 inline image).
 
 Tool-hint keywords are in [`shim/app/router.py`](shim/app/router.py)
 (`_TOOL_HINT_KEYWORDS`) — French + English mix covering mail, calendar,

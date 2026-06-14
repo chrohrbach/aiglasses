@@ -27,6 +27,7 @@ os.environ["LITELLM_API_KEY"] = "sk-anything"
 os.environ["ROKID_FAST_MODEL"] = "fast-model"
 os.environ["ROKID_VISION_MODEL"] = "vision-model"
 os.environ["ROKID_FULL_MODEL"] = "full-model"
+os.environ["ROKID_VISION_TOOL_MODEL"] = "vision-tool-model"
 os.environ["ROKID_FAST_MAX_CHARS"] = "120"
 os.environ["MCP_HUB_URL"] = f"http://127.0.0.1:{MOCK_MCP_HUB_PORT}"
 os.environ["MCP_HUB_AUTH_TOKEN"] = ""
@@ -98,6 +99,27 @@ async def litellm_completions(request: Request):
                 tool_msg[:200],
             ]), media_type="text/event-stream")
 
+    # Vision-tool path: model=vision-tool-model, tools attached + an image is in
+    # the conversation. The model archives the photo via attach_asset, pulling
+    # the EXACT stable URL the shim injected into a system message.
+    if model == "vision-tool-model":
+        has_tool_result = any(m["role"] == "tool" for m in messages)
+        if has_tools and not has_tool_result:
+            archive_url = ""
+            for m in messages:
+                if m["role"] == "system" and isinstance(m["content"], str) and "URLs:" in m["content"]:
+                    archive_url = m["content"].split("URLs:", 1)[1].strip().split(" ;")[0].strip()
+            return StreamingResponse(_tool_call_sse(
+                index=0, id="call_attach_1", name="attach_asset",
+                arguments_json=json.dumps({
+                    "memory_id": "mem-1",
+                    "url": archive_url,
+                    "caption": "famille Dutront au chalet",
+                }),
+            ), media_type="text/event-stream")
+        if has_tool_result:
+            return StreamingResponse(_text_sse(["C'est mémorisé."]), media_type="text/event-stream")
+
     return StreamingResponse(_text_sse(["???"]), media_type="text/event-stream")
 
 
@@ -144,6 +166,28 @@ MOCK_OPENAPI = {
                 },
             }
         },
+        "/tools/attach_asset": {
+            "post": {
+                "summary": "Attach an asset (photo) to a memory",
+                "description": "Archive an asset (e.g. a photo) into a memory and make it searchable via its caption.",
+                "operationId": "attach_asset",
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "memory_id": {"type": "string"},
+                                    "url": {"type": "string"},
+                                    "caption": {"type": "string"},
+                                },
+                                "required": ["memory_id"],
+                            }
+                        }
+                    }
+                },
+            }
+        },
     },
 }
 
@@ -172,6 +216,8 @@ async def hub_tool(profile: str, tool: str, request: Request):
             {"subject": "Réunion équipe", "from": "Julie Martin", "date": "2026-05-22"},
             {"subject": "Newsletter Hebdo", "from": "TechNews", "date": "2026-05-21"},
         ]
+    if tool == "attach_asset":
+        return {"ok": True, "memory_id": args.get("memory_id"), "asset_id": "asset-xyz"}
     return {"error": "unknown tool"}
 
 
@@ -415,8 +461,8 @@ async def main():
         r = await c.get(f"http://127.0.0.1:{SHIM_PORT}/health")
     health = r.json()
     print(f"[T8 health] {health}")
-    if health.get("mcp_tool_count") != 2:
-        failures.append(f"T8 expected 2 tools from mock hub, got {health.get('mcp_tool_count')}")
+    if health.get("mcp_tool_count") != 3:
+        failures.append(f"T8 expected 3 tools from mock hub, got {health.get('mcp_tool_count')}")
 
     # --- T9-T12: ROKID_ALLOWED_USER_IDS allowlist ---
     # The env was empty at import time so the allowlist is currently OFF
@@ -509,6 +555,92 @@ async def main():
             failures.append(f"T15 default X-Plexus-Email should be owner@plexus.test, got {call['email']!r}")
         if call["principal"] != "owner@plexus.test":
             failures.append(f"T15 default X-Plexus-Principal should be owner@plexus.test, got {call['principal']!r}")
+
+    # --- T16: pick_path unit tests (image + memory intent vs plain vision) ---
+    from app import router as shim_router
+    from app.rokid_types import RokidRequest as _RR
+
+    def _mk(items):
+        return _RR(message_id="r", agent_id="t", message=items)
+
+    img = {"role": "user", "type": "image", "image_url": "http://x/y.jpg"}
+    cases = [
+        ("image + memory intent",
+         _mk([{"role": "user", "type": "text", "text": "souviens-toi de cette photo"}, img]),
+         "full"),
+        ("image + plain question",
+         _mk([{"role": "user", "type": "text", "text": "c'est quoi ça ?"}, img]),
+         "vision"),
+        ("short text only",
+         _mk([{"role": "user", "type": "text", "text": "Bonjour"}]),
+         "fast"),
+        ("tool keyword text",
+         _mk([{"role": "user", "type": "text", "text": "Liste mes mails"}]),
+         "full"),
+    ]
+    for label, req_obj, expected in cases:
+        got = shim_router.pick_path(req_obj)
+        print(f"[T16 routing] {label}: {got} (want {expected})")
+        if got != expected:
+            failures.append(f"T16 {label}: got {got}, want {expected}")
+
+    # --- T17: cache_request_images returns archive URL + writes file to disk ---
+    from app import photo_cache as shim_photo
+    cdn_url = f"http://127.0.0.1:{PHOTO_HOST_PORT}/cdn/t17_mem.jpg"
+    cache_req = _mk([{"role": "user", "type": "image", "image_url": cdn_url}])
+    archive_urls = await shim_photo.cache_request_images(cache_req)
+    print(f"[T17 cache] archive_urls={archive_urls}")
+    if len(archive_urls) != 1:
+        failures.append(f"T17 expected 1 archive url, got {archive_urls}")
+    else:
+        au = archive_urls[0]
+        if not au.startswith(f"http://127.0.0.1:{SHIM_PORT}/photos/"):
+            failures.append(f"T17 archive url malformed: {au}")
+        name = au.rsplit("/", 1)[-1]
+        disk_path = os.path.join(os.environ["PHOTO_CACHE_DIR"], name)
+        if not os.path.isfile(disk_path):
+            failures.append(f"T17 archive file not on disk: {disk_path}")
+        else:
+            print(f"[T17 cache] file present on disk: {name}")
+        # The in-request image_url must have been rewritten to base64 for the model.
+        if not cache_req.message[0].image_url.startswith("data:image/"):
+            failures.append("T17 in-request image not inlined as base64")
+
+    # --- T18: image + memory intent -> FULL path, attach_asset dispatched with
+    #          the EXACT archive URL the shim injected ---
+    litellm_calls.clear()
+    hub_tool_calls.clear()
+    mem_cdn_url = f"http://127.0.0.1:{PHOTO_HOST_PORT}/cdn/t18_capture.jpg"
+    ev = await call_shim({
+        "message_id": "m18", "agent_id": "test",
+        "message": [
+            {"role": "user", "type": "text",
+             "text": "souviens-toi de cette photo avec la famille Dutront au chalet"},
+            {"role": "user", "type": "image", "image_url": mem_cdn_url},
+        ],
+    })
+    vt_calls = [c for c in litellm_calls if c.get("model") == "vision-tool-model"]
+    attach_calls = [c for c in hub_tool_calls if c["tool"] == "attach_asset"]
+    text = "".join(d.get("answer_stream", "") for _, d in ev
+                   if d.get("type") == "answer" and not d.get("is_finish"))
+    print(f"[T18 memory-capture] vt_rounds={len(vt_calls)} attach_calls={len(attach_calls)} text={text!r}")
+    if not vt_calls:
+        failures.append("T18 vision-tool-model not called (routing/model selection wrong)")
+    else:
+        # System context must advertise the stable archive URL to the model.
+        sys_msgs = [m for m in vt_calls[0]["messages"]
+                    if m["role"] == "system" and isinstance(m["content"], str)]
+        if not any("/photos/" in m["content"] and "attach_asset" in m["content"] for m in sys_msgs):
+            failures.append("T18 archive URL not injected into system messages")
+    if len(attach_calls) != 1:
+        failures.append(f"T18 expected exactly 1 attach_asset dispatch, got {len(attach_calls)}")
+    else:
+        url_arg = attach_calls[0]["args"].get("url", "")
+        expected_prefix = f"http://127.0.0.1:{SHIM_PORT}/photos/"
+        if not url_arg.startswith(expected_prefix):
+            failures.append(f"T18 attach_asset url arg wrong: {url_arg!r}")
+        else:
+            print(f"[T18 memory-capture] attach_asset url OK: {url_arg}")
 
     print()
     if failures:

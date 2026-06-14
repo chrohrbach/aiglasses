@@ -20,6 +20,11 @@ LITELLM_API_KEY = os.environ.get("LITELLM_API_KEY", "sk-anything")
 FAST_MODEL = os.environ.get("ROKID_FAST_MODEL", "infomaniak-ministral")
 VISION_MODEL = os.environ.get("ROKID_VISION_MODEL", "purpose-vision")
 FULL_MODEL = os.environ.get("ROKID_FULL_MODEL", "purpose-tool-calling")
+# Vision-capable model used on the FULL (tools) path when the conversation
+# carries an image — lets the model both see the photo and call MCP tools
+# (e.g. remember + attach_asset to archive a memory). Defaults to FULL_MODEL,
+# so this is safe even without a dedicated vision-tool model configured.
+VISION_TOOL_MODEL = os.environ.get("ROKID_VISION_TOOL_MODEL", FULL_MODEL)
 LITELLM_TEMPERATURE = float(os.environ.get("LITELLM_TEMPERATURE", "0.4"))
 
 

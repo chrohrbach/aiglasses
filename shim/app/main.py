@@ -132,11 +132,29 @@ async def rokid_agent(
     _check_user_id(req.user_id)
 
     # Replace incoming Rokid CDN URLs with cached local URLs / inlined base64
-    # before the model sees them.
-    await photo_cache.cache_request_images(req)
+    # before the model sees them. Also collect the stable archive URLs so we can
+    # advertise them to the model for attach_asset (photo memory capture).
+    archive_urls = await photo_cache.cache_request_images(req)
 
     path = router.pick_path(req)
     messages = rokid_to_openai_messages(req)
+
+    # Expose the stable archive URLs to the model so it can pass them verbatim to
+    # attach_asset when the user wants to memorise a photo. The model only ever
+    # sees the base64 inline image, never this URL, so we inject it explicitly.
+    if archive_urls:
+        joined = " ; ".join(archive_urls)
+        messages.append({
+            "role": "system",
+            "content": (
+                "Images archivées (URLs stables ~48h) — pour mémoriser une photo, "
+                "crée d'abord le souvenir avec remember(type='memories', ...) puis "
+                "appelle attach_asset(memory_id=<id>, url=<une de ces URLs EXACTES>, "
+                "caption='<courte description>'). N'invente jamais d'URL. "
+                f"URLs: {joined}"
+            ),
+        })
+
     logger.info(
         "path=%s agent_id=%s message_id=%s items=%d turns=%d",
         path,

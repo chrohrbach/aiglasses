@@ -30,6 +30,11 @@ Device actions (emit AT MOST ONE per turn):
 ```
 
 Only emit an action when the user clearly asked for it. Otherwise just answer.
+
+Mémoriser une photo:
+- Quand l'utilisateur veut garder/archiver une photo ("souviens-toi de cette photo", "mémorise ça"), fais-le en DEUX étapes avec les outils: 1) remember(type='memories', data={title, content, occurred_at?, people?, place?, tags?}) pour créer le souvenir; 2) attach_asset(memory_id=<id renvoyé>, url=<URL stable fournie dans le contexte système>, caption='<courte description>').
+- Utilise EXACTEMENT l'URL d'archive donnée dans le contexte système. N'invente jamais d'URL et n'utilise pas l'image base64 comme URL.
+- Confirme brièvement à l'oral ("C'est mémorisé.") sans lire l'URL.
 """
 
 
