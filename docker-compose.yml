@@ -16,6 +16,13 @@ services:
       # only while the agent stays in 草稿/private). MUST be set before
       # publishing the agent to the Rokid store.
       - ROKID_ALLOWED_USER_IDS=${ROKID_ALLOWED_USER_IDS:-}
+      # Plexus principal identity forwarded to MCP backends (per-user creds).
+      # Set ROKID_PRINCIPAL_EMAIL to the email you connected Gmail/Office with;
+      # the shim sends X-Plexus-Principal/Email so the hub resolves YOUR account.
+      - ROKID_PRINCIPAL_EMAIL=${ROKID_PRINCIPAL_EMAIL:-}
+      - ROKID_PRINCIPAL_SUB=${ROKID_PRINCIPAL_SUB:-}
+      - ROKID_PRINCIPAL_TYPE=${ROKID_PRINCIPAL_TYPE:-user}
+      - ROKID_USER_PRINCIPAL_MAP=${ROKID_USER_PRINCIPAL_MAP:-}
       # --- LiteLLM backend (all 3 paths go here) ---
       - LITELLM_URL=${LITELLM_URL:-http://litellm:4000/v1}
       - LITELLM_API_KEY=${LITELLM_API_KEY:-sk-anything}

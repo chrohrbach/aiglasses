@@ -31,6 +31,9 @@ os.environ["ROKID_FAST_MAX_CHARS"] = "120"
 os.environ["MCP_HUB_URL"] = f"http://127.0.0.1:{MOCK_MCP_HUB_PORT}"
 os.environ["MCP_HUB_AUTH_TOKEN"] = ""
 os.environ["ROKID_MCP_PROFILE"] = "personal"
+# Plexus principal identity propagation (per-user MCP credentials).
+os.environ["ROKID_PRINCIPAL_EMAIL"] = "owner@plexus.test"
+os.environ["ROKID_USER_PRINCIPAL_MAP"] = json.dumps({"alice-id": "alice@plexus.test"})
 os.environ["ROKID_CALLBACK_URL"] = f"http://127.0.0.1:{MOCK_ROKID_PORT}/metis/callback/message"
 os.environ["ROKID_SK_TOKEN"] = "sk-rokid-test"
 os.environ["PUSH_SHARED_SECRET"] = "push-secret"
@@ -153,7 +156,15 @@ async def hub_openapi(name: str):
 @mock_hub.post("/profiles/{profile}/tools/{tool}")
 async def hub_tool(profile: str, tool: str, request: Request):
     args = await request.json()
-    hub_tool_calls.append({"profile": profile, "tool": tool, "args": args})
+    hub_tool_calls.append({
+        "profile": profile,
+        "tool": tool,
+        "args": args,
+        # Capture the forwarded Plexus identity so tests can assert propagation.
+        "principal": request.headers.get("x-plexus-principal"),
+        "email": request.headers.get("x-plexus-email"),
+        "ptype": request.headers.get("x-plexus-principal-type"),
+    })
     # Return a canned response per tool
     if tool == "gmail_list_emails":
         return [
@@ -464,6 +475,40 @@ async def main():
 
     # Reset to off so any later mock-test reuse stays open
     shim_main.ROKID_ALLOWED_USER_IDS = set()
+
+    # --- T14: mapped user_id -> that user's Plexus principal forwarded to hub ---
+    hub_tool_calls.clear()
+    await call_shim({
+        "message_id": "m14", "agent_id": "test", "user_id": "alice-id",
+        "message": [{"role": "user", "type": "text", "text": "Liste mes 3 derniers mails"}],
+    })
+    if not hub_tool_calls:
+        failures.append("T14 hub tool not dispatched")
+    else:
+        call = hub_tool_calls[0]
+        print(f"[T14 mapped principal] principal={call['principal']!r} email={call['email']!r} type={call['ptype']!r}")
+        if call["email"] != "alice@plexus.test":
+            failures.append(f"T14 X-Plexus-Email should be alice@plexus.test, got {call['email']!r}")
+        if call["principal"] != "alice@plexus.test":
+            failures.append(f"T14 X-Plexus-Principal should default to email, got {call['principal']!r}")
+        if call["ptype"] != "user":
+            failures.append(f"T14 X-Plexus-Principal-Type should be user, got {call['ptype']!r}")
+
+    # --- T15: unmapped/absent user_id -> default principal forwarded to hub ---
+    hub_tool_calls.clear()
+    await call_shim({
+        "message_id": "m15", "agent_id": "test",
+        "message": [{"role": "user", "type": "text", "text": "Liste mes 3 derniers mails"}],
+    })
+    if not hub_tool_calls:
+        failures.append("T15 hub tool not dispatched")
+    else:
+        call = hub_tool_calls[0]
+        print(f"[T15 default principal] principal={call['principal']!r} email={call['email']!r}")
+        if call["email"] != "owner@plexus.test":
+            failures.append(f"T15 default X-Plexus-Email should be owner@plexus.test, got {call['email']!r}")
+        if call["principal"] != "owner@plexus.test":
+            failures.append(f"T15 default X-Plexus-Principal should be owner@plexus.test, got {call['principal']!r}")
 
     print()
     if failures:

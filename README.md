@@ -56,6 +56,35 @@ Tool-hint keywords are in [`shim/app/router.py`](shim/app/router.py)
 (`_TOOL_HINT_KEYWORDS`) — French + English mix covering mail, calendar,
 contacts, smart home, knowledge, github, tasks, web search.
 
+### Per-user identity (Plexus principal propagation)
+
+Per-user MCP tools (Gmail, Office, …) don't take a username argument: each
+Plexus backend resolves the **caller** from gateway-injected `X-Plexus-*`
+headers, then looks up that principal's stored OAuth token in the credential
+broker. On the public OpenWebUI path the gateway injects those headers from the
+SSO session; the shim talks to `mcp-hub` directly, so it must inject them
+itself — otherwise the backend sees `caller email = None` and replies
+"connect your account".
+
+[`shim/app/identity.py`](shim/app/identity.py) maps the Rokid `user_id` to a
+Plexus principal and emits three headers on every `mcp-hub` request (both the
+OpenAPI fetch and the tool dispatch):
+
+| Header | Source | Notes |
+|---|---|---|
+| `X-Plexus-Principal` | `ROKID_PRINCIPAL_SUB`, else the email | **Required** — Plexus returns no principal without it |
+| `X-Plexus-Principal-Type` | `ROKID_PRINCIPAL_TYPE` (default `user`) | |
+| `X-Plexus-Email` | `ROKID_PRINCIPAL_EMAIL` | Must equal the email the account was connected with in Plexus |
+
+Configuration (see [`.env.example`](.env.example)):
+
+- `ROKID_PRINCIPAL_EMAIL` — default principal for all glasses (single-owner setup).
+- `ROKID_USER_PRINCIPAL_MAP` — optional JSON `{"<rokid_user_id>": "<email>"}`
+  to map individual glasses to different Plexus accounts.
+
+If neither is set the shim logs a warning and per-user tools run without a
+caller identity (unchanged legacy behaviour).
+
 ### Photo cache
 
 Rokid serves camera frames from its own CDN with short-lived URLs. The shim

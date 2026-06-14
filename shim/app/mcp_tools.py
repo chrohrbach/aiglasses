@@ -15,6 +15,11 @@ This module:
 Auth: when MCP_HUB_AUTH_TOKEN is set, every request sends
 `Authorization: Bearer <token>`. Inside mcp-network on the LXC the hub
 trusts cluster-local traffic so the token is optional in practice.
+
+Identity: a catalog may carry `identity_headers` (the X-Plexus-* set produced
+by `identity.Principal.headers()`). These are sent on every hub request so the
+hub forwards the caller's principal to the backend, letting Plexus resolve the
+caller's own per-user credential (e.g. their connected Gmail). See app.identity.
 """
 
 import asyncio
@@ -42,12 +47,6 @@ ROKID_MCP_PROFILES = [
 ]
 MCP_TOOLS_CACHE_TTL = int(os.environ.get("MCP_TOOLS_CACHE_TTL", "300"))
 MCP_TOOL_TIMEOUT = float(os.environ.get("MCP_TOOL_TIMEOUT", "30"))
-
-
-def _auth_headers() -> dict[str, str]:
-    if MCP_HUB_AUTH_TOKEN:
-        return {"Authorization": f"Bearer {MCP_HUB_AUTH_TOKEN}"}
-    return {}
 
 
 def _operation_to_tool(operation_id: str, op: dict) -> dict | None:
@@ -86,6 +85,10 @@ class McpToolCatalog:
     profile to define a given operationId wins (later duplicates skipped). The
     catalog remembers which profile each tool came from so `dispatch()` POSTs
     to the right URL.
+
+    `identity_headers` (optional) are the X-Plexus-* headers carrying the
+    caller's Plexus principal; they ride on every hub request so the hub can
+    forward the identity to the backend (per-user credential resolution).
     """
 
     def __init__(
@@ -96,15 +99,11 @@ class McpToolCatalog:
         auth_token: str = MCP_HUB_AUTH_TOKEN,
         cache_ttl: int = MCP_TOOLS_CACHE_TTL,
         timeout: float = MCP_TOOL_TIMEOUT,
-        user_id: str | None = None,
+        identity_headers: dict[str, str] | None = None,
     ):
         self.hub_url = hub_url.rstrip("/")
-        self.user_id = user_id
-        base_profiles = profiles or list(ROKID_MCP_PROFILES)
-        if user_id:
-            self.profiles = [f"{user_id}_{p}" for p in base_profiles]
-        else:
-            self.profiles = base_profiles
+        self.profiles = profiles or list(ROKID_MCP_PROFILES)
+        self.identity_headers = dict(identity_headers or {})
         self.auth_token = auth_token
         self.cache_ttl = cache_ttl
         self.timeout = timeout
@@ -120,7 +119,11 @@ class McpToolCatalog:
 
     @property
     def _headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self.auth_token}"} if self.auth_token else {}
+        headers: dict[str, str] = {}
+        if self.auth_token:
+            headers["Authorization"] = f"Bearer {self.auth_token}"
+        headers.update(self.identity_headers)
+        return headers
 
     async def _fetch_one_profile(self, client: httpx.AsyncClient, profile: str) -> dict:
         url = f"{self.hub_url}/profiles/{profile}/openapi.json"

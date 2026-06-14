@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from . import photo_cache, rokid_callback, router
+from .identity import Principal, resolver_from_env
 from .mcp_tools import McpToolCatalog
 from .rokid_types import RokidEventPayload, RokidRequest, RokidToolCall
 from .tool_extractor import split_stream
@@ -53,15 +54,24 @@ else:
 app = FastAPI(title="Rokid → Plexus shim")
 catalog = McpToolCatalog()
 
-_catalogs_cache: dict[str | None, McpToolCatalog] = {}
+# Maps a Rokid user_id -> the Plexus principal the shim acts as for that caller.
+# Drives the X-Plexus-* identity headers forwarded to MCP backends so Plexus can
+# resolve the caller's own per-user credentials (Gmail, Office, …).
+_principal_resolver = resolver_from_env()
+
+# One catalog per distinct identity (keyed by its X-Plexus-* header set). The
+# tool *definitions* are identity-independent; the headers differ per principal.
+_catalogs_cache: dict[tuple[tuple[str, str], ...], McpToolCatalog] = {}
 _catalogs_lock = asyncio.Lock()
 
 
-async def get_catalog_for_user(user_id: str | None) -> McpToolCatalog:
+async def get_catalog_for_principal(principal: Principal | None) -> McpToolCatalog:
+    headers = principal.headers() if principal else {}
+    key = tuple(sorted(headers.items()))
     async with _catalogs_lock:
-        if user_id not in _catalogs_cache:
-            _catalogs_cache[user_id] = McpToolCatalog(user_id=user_id)
-        return _catalogs_cache[user_id]
+        if key not in _catalogs_cache:
+            _catalogs_cache[key] = McpToolCatalog(identity_headers=headers)
+        return _catalogs_cache[key]
 
 
 @app.get("/health")
@@ -136,7 +146,22 @@ async def rokid_agent(
         len(messages),
     )
 
-    req_catalog = await get_catalog_for_user(req.user_id)
+    # Resolve the Plexus principal this caller acts as. The X-Plexus-* headers
+    # produced here ride on every mcp-hub request (via the catalog) so backends
+    # resolve the caller's own per-user credentials.
+    principal = _principal_resolver.for_user(req.user_id)
+    if principal:
+        logger.info(
+            "principal email=%s sub=%s type=%s (user_id=%r)",
+            principal.email, principal.sub, principal.type, req.user_id,
+        )
+    else:
+        logger.info(
+            "no principal resolved for user_id=%r — per-user MCP tools run "
+            "without a caller identity", req.user_id,
+        )
+
+    req_catalog = await get_catalog_for_principal(principal)
 
     async def event_stream():
         pending_tool: dict | None = None
