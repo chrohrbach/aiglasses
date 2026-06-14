@@ -1,10 +1,11 @@
 # aiglasses
 
 Bridges the **Rokid AI Glasses** (Lingzhu / 灵珠 custom-agent slot) to the local
-**Plexus stack** (OpenWebUI + 12 MCP tool servers, deployed via
-`mcp-servers/`). Rokid POSTs an SSE request; the shim translates to
-OpenWebUI's OpenAI-compatible chat-completions, streams the reply back in
-Rokid's expected event format, and can emit AR device commands
+**Plexus stack** (LiteLLM + the MCP tool fleet behind `mcp-hub`, deployed via
+`mcp-servers/`). Rokid POSTs an SSE request; the shim routes it, drives the
+agent loop directly against LiteLLM (calling MCP tools via `mcp-hub` as
+needed), streams the reply back in Rokid's expected event format, and can emit
+AR device commands
 (take_photo / take_navigation / control_calendar / notify_agent_off).
 
 ## Why a shim is needed
@@ -18,10 +19,15 @@ OpenAI-compatible. Its custom-agent contract uses:
   each carrying `{ role:"agent", message_id, agent_id, answer_stream,
   is_finish, type:"answer"|"tool_call"|"follow_up", ... }`
 
-OpenWebUI speaks plain OpenAI chat-completions. The shim is the adapter.
+OpenWebUI speaks plain OpenAI chat-completions; LiteLLM is the OpenAI-compatible
+proxy in front of every model (Swiss/Infomaniak, OpenRouter, …). The shim is the
+adapter between Rokid's contract and that OpenAI surface.
 
-Full spec extracted from the official Rokid Yuque doc and saved at
-`docs/rokid-spec.md` (and in Claude memory for cross-session reference).
+The Rokid contract is documented inline in
+[`shim/app/main.py`](shim/app/main.py) and
+[`shim/app/rokid_types.py`](shim/app/rokid_types.py); the upstream source is the
+official Rokid Yuque doc
+(<https://rokid.yuque.com/ub8h5n/hth52o/qq4gs616xz4ellh1>).
 
 ## Architecture
 
@@ -29,15 +35,22 @@ Full spec extracted from the official Rokid Yuque doc and saved at
 Rokid Glasses ──POST /rokid/agent──► rokid-shim (FastAPI, :8024)
                                          │
                                          │  router.pick_path(req)
-                                         │     ├─ image in payload   ──► VISION  ──► LiteLLM (purpose-vision)
-                                         │     ├─ short + no keyword ──► FAST    ──► LiteLLM (infomaniak-ministral)
-                                         │     └─ otherwise           ──► FULL    ──► OpenWebUI
-                                         │                                            │
-                                         │                                            └─► 12 MCP tool servers
+                                         │     ├─ image in payload   ──► VISION ──► LiteLLM (ROKID_VISION_MODEL)
+                                         │     ├─ short + no keyword ──► FAST   ──► LiteLLM (ROKID_FAST_MODEL)
+                                         │     └─ otherwise           ──► FULL   ──► agent_loop ──► LiteLLM (ROKID_FULL_MODEL)
+                                         │                                                            │
+                                         │                                                            └─► mcp-hub tools (mcp_tools.py)
                                          │
                                          ├──► POST /push   (async push back to glasses via Rokid /metis/callback/message)
                                          └──► GET  /photos/{hash}  (serves cached camera frames)
 ```
+
+All three paths hit **LiteLLM** directly — OpenWebUI is no longer in the
+request path. The "full" path runs the agent loop inside the shim
+([`shim/app/agent_loop.py`](shim/app/agent_loop.py)): it streams the model's
+text, dispatches any `tool_calls` against `mcp-hub`
+([`shim/app/mcp_tools.py`](shim/app/mcp_tools.py)), feeds the results back, and
+loops until the model stops requesting tools (`max_rounds` cap).
 
 The shim is deployed on the same Proxmox LXC as `mcp-servers/` and joins the
 existing `mcp-network` Docker network. Caddy on the LXC routes
@@ -48,21 +61,49 @@ publicly with valid TLS so Rokid accepts it.
 
 | Trigger | Path | Model | Why |
 |---|---|---|---|
-| Any `image_url` item in `message[]` | vision | `ROKID_VISION_MODEL` (default `purpose-vision`) | OpenWebUI multimodal tool fanout is overkill for "what is this?" — direct LiteLLM is faster |
+| Any `image_url` item in `message[]` | vision | `ROKID_VISION_MODEL` (default `purpose-vision`) | Direct LiteLLM vision call — no tool fanout needed for "what is this?" |
 | Last user text ≤ `ROKID_FAST_MAX_CHARS` chars AND no tool-hint keyword | fast | `ROKID_FAST_MODEL` (default `infomaniak-ministral`) | Sub-second TTFT for voice via Swiss-AI |
-| Anything else | full | `OPENWEBUI_MODEL` (default `purpose-tool-calling` → `infomaniak-gemma4`) | OpenWebUI dispatches MCP tools as needed |
+| Anything else | full | `ROKID_FULL_MODEL` (default `claude-haiku-4-5`) | Agent loop dispatches MCP tools via `mcp-hub` as needed |
 
 Tool-hint keywords are in [`shim/app/router.py`](shim/app/router.py)
 (`_TOOL_HINT_KEYWORDS`) — French + English mix covering mail, calendar,
 contacts, smart home, knowledge, github, tasks, web search.
+
+### Authorization (per-user allowlist)
+
+The Rokid `ROKID_AK` is a **shared** secret between Lingzhu and the shim, not
+per-user: any Rokid user who installs your published agent would reach your MCP
+fleet (Gmail, Office, casasmooth) with the same AK. `ROKID_ALLOWED_USER_IDS`
+([`shim/app/main.py`](shim/app/main.py), `_check_user_id`) is a comma-separated
+allowlist of Rokid `user_id`s permitted to invoke the agent:
+
+- **Empty / unset (default)** = allowlist DISABLED, every authenticated caller
+  is allowed. Safe **only** while the agent stays in 草稿/private on Lingzhu.
+- Before publishing (提审/发布) you **MUST** populate it. Find your own
+  `user_id` after a real glasses call with
+  `docker logs rokid-shim | grep INCOMING`.
+
+Rejected callers get `403`; a request with no `user_id` while the allowlist is
+enforced also gets `403`.
+
+### MCP tools (mcp-hub profiles)
+
+The full path's tools come from `mcp-hub`'s per-profile OpenAPI surface
+([`shim/app/mcp_tools.py`](shim/app/mcp_tools.py)): it fetches
+`GET /profiles/<name>/openapi.json` (TTL-cached) and dispatches via
+`POST /profiles/<name>/tools/<tool>`. `ROKID_MCP_PROFILES` is a comma-separated
+list of profiles to merge into one flat tool list (default
+`mail,personal,knowledge`). Available profiles: `mail`, `personal`,
+`knowledge`, `dev`, `agents`. (The legacy singular `ROKID_MCP_PROFILE` is still
+honored if `ROKID_MCP_PROFILES` is unset.)
 
 ### Per-user identity (Plexus principal propagation)
 
 Per-user MCP tools (Gmail, Office, …) don't take a username argument: each
 Plexus backend resolves the **caller** from gateway-injected `X-Plexus-*`
 headers, then looks up that principal's stored OAuth token in the credential
-broker. On the public OpenWebUI path the gateway injects those headers from the
-SSO session; the shim talks to `mcp-hub` directly, so it must inject them
+broker. On the public path a gateway injects those headers from the SSO
+session; the shim talks to `mcp-hub` directly, so it must inject them
 itself — otherwise the backend sees `caller email = None` and replies
 "connect your account".
 
@@ -96,7 +137,13 @@ instead. Benefits:
   (e.g. attach to email via mcp-gmail).
 - The model fetches from inside `mcp-network` rather than out to Rokid,
   saving a hop.
-- Configurable retention (`PHOTO_RETENTION_HOURS`, default 48h).
+- Configurable retention (`PHOTO_RETENTION_HOURS`, default 48h) and a max size
+  guard (`PHOTO_MAX_BYTES`, default 10 MiB).
+- When `PHOTO_INLINE_BASE64=true` (default) the cached frame is inlined as a
+  `data:` URL in the LLM request, so cloud backends (e.g. OpenRouter) that
+  can't reach internal URLs still see the image; the disk copy is kept for
+  downstream tool re-use. Set it to `false` to send `${PHOTOS_PUBLIC_URL}`
+  links instead (only viable when that URL is internet-reachable).
 
 ### Async push
 
@@ -122,13 +169,15 @@ shim/
 ├── Dockerfile
 ├── requirements.txt
 └── app/
-    ├── main.py              FastAPI app — /rokid/agent + /push + /photos/{name} + /health
+    ├── main.py              FastAPI app — /rokid/agent + /push + /photos/{name} + /health, AK + allowlist auth
     ├── rokid_types.py       Pydantic models for the Rokid contract
     ├── translator.py        Rokid message[] -> OpenAI messages[] + system prompt
     ├── router.py            Decide fast / vision / full per request
-    ├── openwebui_client.py  Async streaming client for the "full" path
-    ├── litellm_client.py    Async streaming client for the "fast" + "vision" paths
-    ├── photo_cache.py       Download Rokid camera frames, expose locally
+    ├── agent_loop.py        FULL path: multi-round LLM ⇄ MCP-tool loop, streams text
+    ├── mcp_tools.py         Fetch tool defs from mcp-hub profiles + dispatch tool calls
+    ├── litellm_client.py    Async streaming client for LiteLLM (all 3 paths)
+    ├── identity.py          Map Rokid user_id -> Plexus principal, emit X-Plexus-* headers
+    ├── photo_cache.py       Download Rokid camera frames, expose locally / inline base64
     ├── rokid_callback.py    POST to Rokid /metis/callback/message
     └── tool_extractor.py    Parse fenced ```rokid_action JSON from LLM output
 
@@ -136,7 +185,7 @@ deploy/
 └── glasses_hostname.caddyfile   Caddy site block, drop into mcp-servers/deploy-local/local-caddy/sites/
 
 docker-compose.yml          Joins mcp-network external, exposes :8024, photo_cache volume
-.env.example                ROKID_*, OPENWEBUI_*, LITELLM_*, PHOTOS_*, PUSH_*
+.env.example                ROKID_*, LITELLM_*, MCP_HUB_*, PHOTO_*, PUSH_*
 ```
 
 ## Deploy (LXC 500)
@@ -150,7 +199,9 @@ Assumes `mcp-servers/` is already running on LXC 500 with the
    cp .env.example .env
    # ROKID_AK: a long random string (paste this back into Lingzhu later)
    openssl rand -hex 24
-   # OPENWEBUI_API_KEY: generated in OpenWebUI → Settings → Account → API Key
+   # LITELLM_API_KEY: the key your LiteLLM proxy accepts (sk-anything if open)
+   # ROKID_PRINCIPAL_EMAIL: the email you connected Gmail/Office with in Plexus
+   # Before publishing: set ROKID_ALLOWED_USER_IDS to your own Rokid user_id
    ```
 
 2. **Ship the repo to the LXC** — same pattern as the rest of `mcp-servers/`
@@ -179,7 +230,7 @@ Assumes `mcp-servers/` is already running on LXC 500 with the
 
    ```bash
    curl https://glasses.rohrbach.app/health
-   # {"status":"ok"}
+   # {"status":"ok","mcp_profile":"mail,personal,knowledge","mcp_tool_count":117,"mcp_tool_error":null}
 
    curl -N -X POST https://glasses.rohrbach.app/rokid/agent \
      -H "Authorization: Bearer $ROKID_AK" \
@@ -234,18 +285,24 @@ uvicorn app.main:app --reload --port 8024
 ## Integration test
 
 `integration_test.py` at the repo root spins up four mock servers in-process
-(OpenWebUI, LiteLLM, Rokid callback, and a fake camera-frame CDN), runs the
-shim against them, and asserts the full v2 flow:
+(LiteLLM with a multi-round agent, mcp-hub serving an OpenAPI spec + tool
+dispatch, Rokid callback, and a fake camera-frame CDN), runs the shim against
+them, and asserts the full v3 flow:
 
 1. Short text → fast path hits LiteLLM with the fast model
 2. Image present → vision path hits LiteLLM with the vision model, and the
-   image URL is rewritten to the local `/photos/<sha>` cache
-3. Tool-keyword text → full path hits OpenWebUI
-4. Long text without keywords → full path
-5. Fenced `rokid_action` extraction works end-to-end on the full path
-6. Bad AK is rejected (401)
-7. `POST /push` proxies correctly to Rokid's callback with the sk token
-8. `POST /push` without the shared secret is rejected (401)
+   image URL is rewritten / inlined from the local `/photos/<sha>` cache
+3. Tool-keyword text → full path runs the agent loop (LiteLLM ⇄ mcp-hub tool
+   dispatch over multiple rounds)
+4. Fenced `rokid_action` extraction works end-to-end and is emitted as a
+   `tool_call` SSE event
+5. Bad AK is rejected (401)
+6. `POST /push` proxies correctly to Rokid's callback with the sk token, and is
+   rejected (401) without the shared secret
+7. `ROKID_ALLOWED_USER_IDS` allowlist: disabled = all allowed; enforced =
+   listed user 200, unlisted/missing user 403
+8. Plexus principal resolution: `ROKID_USER_PRINCIPAL_MAP` maps a user to their
+   own principal, otherwise `ROKID_PRINCIPAL_EMAIL` is the default
 
 ```bash
 python integration_test.py
